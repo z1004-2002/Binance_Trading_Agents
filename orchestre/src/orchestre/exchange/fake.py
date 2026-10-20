@@ -1,4 +1,8 @@
-"""FakeExchange : exchange scripté pour les tests, sans réseau (EX-SEC-18, EX-QA-04)."""
+"""FakeExchange : exchange scripté pour les tests, sans réseau (EX-SEC-18, EX-QA-04).
+
+Un ordre avec prix est un `LIMIT_MAKER` : rejeté s'il s'exécuterait immédiatement (EX-ST-04),
+sinon il reste en attente et se remplit quand `set_price` traverse son niveau.
+"""
 
 from __future__ import annotations
 
@@ -23,10 +27,22 @@ class FakeExchange(Exchange):
         self._fee_rate = fee_rate
         self._quote = quote
         self._orders: dict[tuple[str, str], OrderResult] = {}
+        self._resting: dict[tuple[str, str], OrderRequest] = {}
 
-    def set_price(self, symbol: str, price: Decimal) -> None:
+    # --- scénario ---
+    def set_price(self, symbol: str, price: Decimal) -> list[OrderResult]:
+        """Met à jour le prix et retourne les ordres en attente nouvellement exécutés."""
         self._prices[symbol] = price
+        filled = []
+        for key, req in list(self._resting.items()):
+            if key[0] != symbol:
+                continue
+            crossed = price <= req.price if req.side is Side.BUY else price >= req.price
+            if crossed:
+                filled.append(self._fill_resting(key, req))
+        return filled
 
+    # --- lecture ---
     def get_filters(self, symbol: str) -> SymbolFilters:
         return self._filters[symbol]
 
@@ -39,6 +55,10 @@ class FakeExchange(Exchange):
     def get_order(self, symbol: str, client_order_id: str) -> OrderResult | None:
         return self._orders.get((symbol, client_order_id))
 
+    def get_open_orders(self, symbol: str) -> list[OrderResult]:
+        return [r for (s, _), r in self._orders.items() if s == symbol and r.status == "NEW"]
+
+    # --- écriture ---
     def place_order(self, request: OrderRequest) -> OrderResult:
         key = (request.symbol, request.client_order_id)
         if key in self._orders:
@@ -51,6 +71,28 @@ class FakeExchange(Exchange):
         except FilterError:
             return self._store(request, Decimal("0"), price, Decimal("0"), "REJECTED")
 
+        if request.price is not None:
+            return self._place_resting(request)
+        return self._place_market(request, price)
+
+    def cancel_order(self, symbol: str, client_order_id: str) -> OrderResult:
+        key = (symbol, client_order_id)
+        existing = self._orders.get(key)
+        if existing is None:
+            raise KeyError(f"ordre inconnu: {client_order_id}")
+        req = self._resting.pop(key, None)
+        if req is None:
+            return existing
+        base = symbol.removesuffix(self._quote)
+        if req.side is Side.BUY:
+            cost = req.quantity * req.price
+            self._balances[self._quote] += cost + cost * self._fee_rate
+        else:
+            self._balances[base] += req.quantity
+        return self._store(req, Decimal("0"), req.price, Decimal("0"), "CANCELED")
+
+    # --- interne ---
+    def _place_market(self, request: OrderRequest, price: Decimal) -> OrderResult:
         base = request.symbol.removesuffix(self._quote)
         cost = request.quantity * price
         fee = cost * self._fee_rate
@@ -68,11 +110,36 @@ class FakeExchange(Exchange):
             )
         return self._store(request, request.quantity, price, fee, "FILLED")
 
-    def cancel_order(self, symbol: str, client_order_id: str) -> OrderResult:
-        existing = self._orders.get((symbol, client_order_id))
-        if existing is None:
-            raise KeyError(f"ordre inconnu: {client_order_id}")
-        return existing
+    def _place_resting(self, request: OrderRequest) -> OrderResult:
+        last = self._prices[request.symbol]
+        base = request.symbol.removesuffix(self._quote)
+        if request.side is Side.BUY:
+            if request.price >= last:
+                return self._store(request, Decimal("0"), request.price, Decimal("0"), "REJECTED")
+            cost = request.quantity * request.price
+            need = cost + cost * self._fee_rate
+            if self._balances.get(self._quote, Decimal("0")) < need:
+                return self._store(request, Decimal("0"), request.price, Decimal("0"), "REJECTED")
+            self._balances[self._quote] -= need
+        else:
+            if request.price <= last:
+                return self._store(request, Decimal("0"), request.price, Decimal("0"), "REJECTED")
+            if self._balances.get(base, Decimal("0")) < request.quantity:
+                return self._store(request, Decimal("0"), request.price, Decimal("0"), "REJECTED")
+            self._balances[base] -= request.quantity
+        self._resting[(request.symbol, request.client_order_id)] = request
+        return self._store(request, Decimal("0"), request.price, Decimal("0"), "NEW")
+
+    def _fill_resting(self, key: tuple[str, str], req: OrderRequest) -> OrderResult:
+        del self._resting[key]
+        base = req.symbol.removesuffix(self._quote)
+        cost = req.quantity * req.price
+        fee = cost * self._fee_rate
+        if req.side is Side.BUY:
+            self._balances[base] = self._balances.get(base, Decimal("0")) + req.quantity
+        else:
+            self._balances[self._quote] = self._balances.get(self._quote, Decimal("0")) + cost - fee
+        return self._store(req, req.quantity, req.price, fee, "FILLED")
 
     def _store(
         self, req: OrderRequest, qty: Decimal, price: Decimal, fee: Decimal, status: str
@@ -85,6 +152,7 @@ class FakeExchange(Exchange):
             avg_price=price,
             fee_quote=fee,
             status=status,
+            orig_qty=req.quantity,
         )
         self._orders[(req.symbol, req.client_order_id)] = result
         return result

@@ -27,6 +27,7 @@ class OrderResult:
     avg_price: Decimal
     fee_quote: Decimal
     status: str  # "FILLED" | "NEW" | "CANCELED" | "REJECTED"
+    orig_qty: Decimal = Decimal("0")
 
 
 class Exchange(ABC):
@@ -42,6 +43,9 @@ class Exchange(ABC):
 
     @abstractmethod
     def get_order(self, symbol: str, client_order_id: str) -> OrderResult | None: ...
+
+    @abstractmethod
+    def get_open_orders(self, symbol: str) -> list[OrderResult]: ...
 
     # --- écriture (ExecutionAgent uniquement) ---
     @abstractmethod
