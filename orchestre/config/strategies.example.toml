@@ -1,0 +1,22 @@
+# Stratégies de l'équipe. Ajouter ces sections à settings.toml (ou fournir ce fichier à --config).
+# Tout est désactivé tant que `enabled = true` n'est pas posé. Montants en chaînes : décimal exact.
+
+[strategies.dca]
+enabled = true
+symbol = "BTCUSDT"
+amount_quote = "20"
+interval_days = 7
+start = "2026-10-20T12:00:00+00:00"   # UTC ; première échéance
+cumulative_cap = "100"
+missed_policy = "skip"                # "skip" | "catchup_once"
+modulated = false
+
+[strategies.grid]
+enabled = true
+symbol = "BTCUSDT"
+lower = "55000"
+upper = "65000"
+intervals = 20
+budget_quote = "200"
+fee_rate = "0.001"
+exit_policy = "pause"                 # "pause" | "wait" | "close"

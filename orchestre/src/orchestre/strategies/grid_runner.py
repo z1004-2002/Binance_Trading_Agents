@@ -35,7 +35,11 @@ class GridRunner:
         context_for: ContextFactory,
         base_asset: str = "BTC",
         env: Env = Env.TESTNET,
+        exit_policy: str = "pause",
     ) -> None:
+        if exit_policy not in ("pause", "wait", "close"):
+            raise ValueError("exit_policy : pause, wait ou close")
+        self._exit_policy = exit_policy
         self._cfg = cfg
         self._svc = service
         self._context_for = context_for
@@ -87,13 +91,34 @@ class GridRunner:
         """À appeler à chaque tick : sortie de fourchette puis règlement des exécutions."""
         if self.halted:
             return
-        if range_status(self._cfg, price) == "BELOW_STOP":
+        if range_status(self._cfg, price) == "BELOW_STOP" and self._exit_policy != "wait":
             self.halted = True
+            for report in self._svc.sync(self._cfg.symbol):  # enregistrer d'abord ce qui a été exécuté
+                self._on_filled(report.result, reinvest=False)
             self._svc.cancel_all_open(self._cfg.symbol)
             self._live.clear()
+            if self._exit_policy == "close":
+                self._liquidate(price)
             return
         for report in self._svc.sync(self._cfg.symbol):
             self._on_filled(report.result)
+
+    def _liquidate(self, price: Decimal) -> None:
+        """Vend au marché l'inventaire acheté par la grille (réduction de risque, C-08)."""
+        quantity = sum((q for _, q in self._open_buys.values()), Decimal("0"))
+        self._open_buys.clear()
+        if quantity <= 0:
+            return
+        proposal = OrderProposal(
+            agent_id=self._cfg.agent_id, symbol=self._cfg.symbol, base_asset=self._base,
+            side=Side.SELL, quantity=quantity, price=price, limit_price=None, env=self._env,
+            est_fee=quantity * price * self._cfg.fee_rate, reduces_risk=True,
+        )
+        decision = review(proposal, self._context_for(proposal))
+        if not decision.approved:
+            self.rejections.append(decision)
+            return
+        self._svc.execute(decision.order, f"{self._cfg.agent_id}-CLOSE")
 
     def _submit(self, order: GridOrder) -> ExecutionReport | None:
         proposal = OrderProposal(
@@ -117,7 +142,7 @@ class GridRunner:
             self._live[order.client_order_id] = order
         return report
 
-    def _on_filled(self, result: OrderResult) -> None:
+    def _on_filled(self, result: OrderResult, reinvest: bool = True) -> None:
         order = self._live.pop(result.client_order_id, None)
         if order is None:
             return
@@ -132,6 +157,8 @@ class GridRunner:
                     buy_price, result.avg_price, result.filled_qty, self._cfg.fee_rate
                 )
                 self.cycles_completed += 1
+        if not reinvest:
+            return
         nxt = on_fill(
             self._cfg, GridFill(order.level, order.side, result.filled_qty, result.avg_price, cycle)
         )

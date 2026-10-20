@@ -54,7 +54,7 @@ SCHEMA_VERSION = len(MIGRATIONS)
 
 class Database:
     def __init__(self, path: str | Path) -> None:
-        self.conn = sqlite3.connect(str(path), isolation_level=None)
+        self.conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         if str(path) != ":memory:":
             self.conn.execute("pragma journal_mode = wal")

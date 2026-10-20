@@ -123,3 +123,44 @@ def test_rejections_are_recorded_when_budget_too_small():
     )
     runner.start(D("60000"))
     assert runner.rejections and runner.rejections[0].rule_id == "R-03"
+
+
+# --- politique de sortie de fourchette (§11.3) ---
+
+def build_with_policy(policy):
+    ex, ledger, svc, _ = build()
+
+    def ctx(_p):
+        return replace(
+            context(),
+            agent_budget_available=ledger.account("grid").available,
+            balance_quote=ex.get_balances()["USDT"],
+            max_open_orders_agent=100, max_orders_per_day=1000, max_price_deviation_pct=D("0.25"),
+        )
+
+    return ex, ledger, svc, GridRunner(CFG, svc, ctx, exit_policy=policy)
+
+
+def test_invalid_exit_policy_refused():
+    with pytest.raises(ValueError):
+        build_with_policy("explode")
+
+
+def test_wait_policy_keeps_orders_below_stop():
+    ex, _, _, runner = build_with_policy("wait")
+    runner.start(D("60000"))
+    before = len(ex.get_open_orders("BTCUSDT"))
+    move(ex, runner, D("53000"))
+    assert not runner.halted and len(ex.get_open_orders("BTCUSDT")) >= before - 1
+
+
+def test_close_policy_sells_inventory_and_leaves_nothing_open():
+    ex, _, _, runner = build_with_policy("close")
+    runner.start(D("60000"))
+    k = max(i for i, p in enumerate(LEVELS) if p < D("60000"))
+    move(ex, runner, LEVELS[k] - D("1"))  # un achat exécuté : de l'inventaire en BTC
+    assert ex.get_balances().get("BTC", D("0")) == D("0")  # il est engagé dans une vente en attente
+    move(ex, runner, D("53000"))
+    assert runner.halted and ex.get_open_orders("BTCUSDT") == []
+    assert ex.get_balances().get("BTC", D("0")) == D("0")
+    assert ex.get_balances()["USDT"] > D("900")

@@ -9,6 +9,10 @@ from decimal import Decimal
 from orchestre.exchange.filters import Side, SymbolFilters
 
 
+class IpBannedError(RuntimeError):
+    """Adresse IP bannie par la plateforme (HTTP 418) : pause de toute l'équipe (EX-EX-07)."""
+
+
 @dataclass(frozen=True)
 class OrderRequest:
     symbol: str

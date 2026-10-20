@@ -44,7 +44,8 @@ class Supervisor:
         alerts = [f"agent {aid} silencieux depuis plus de {self._timeout}" for aid in silent]
         critical_silent = any(aid in self._critical for aid in silent)
         for aid in silent:
-            self._agents[aid].degrade()
+            if aid in self._critical or not critical_silent:
+                self._agents[aid].degrade()  # sinon la cause est l'agent critique : les stratèges sont mis en pause
         if critical_silent:
             for aid, agent in self._agents.items():
                 if aid not in self._critical and agent.state is AgentState.RUNNING:

@@ -14,6 +14,8 @@ KEYS = {"BINANCE_TESTNET_API_KEY": "kk-test", "BINANCE_TESTNET_API_SECRET": "ss-
 
 
 def run(argv, environ=None, factory=None):
+    if argv[0] in ("check-config", "check-keys", "run", "cancel-all") and "--env-file" not in argv:
+        argv = [*argv, "--env-file", "/nonexistent/.env"]  # ne jamais lire le vrai .env
     out, err = io.StringIO(), io.StringIO()
     code = main(argv, environ=environ or {}, out=out, err=err, client_factory=factory)
     return code, out.getvalue(), err.getvalue()
@@ -156,3 +158,109 @@ def test_missing_env_file_is_ignored(tmp_path):
     env = {}
     load_env_file(tmp_path / "absent", env)
     assert env == {}
+
+
+# --- run / cancel-all ---
+
+from tests.unit.test_binance_adapter import order  # noqa: E402
+
+
+class RunStub(StubClient):
+    restrictions = None
+    open_orders_script = None
+
+    def load_time_difference(self):
+        return 0
+
+    def sapiGetAccountApiRestrictions(self):
+        return self.restrictions
+
+
+def team_cfg(tmp_path, env="testnet", cap="500", extra=""):
+    text = (
+        f'env = "{env}"\nmax_total_capital_quote = "{cap}"\ndry_run = true\n{extra}\n'
+        '[strategies.dca]\nenabled = true\nsymbol = "BTCUSDT"\namount_quote = "20"\n'
+        'interval_days = 7\nstart = "2026-01-05T12:00:00+00:00"\ncumulative_cap = "100"\n'
+    )
+    return write_cfg(tmp_path, text)
+
+
+def run_args(tmp_path, cfg, *extra):
+    return ["run", "--config", cfg, "--db", str(tmp_path / "v" / "o.db"),
+            "--stop-file", str(tmp_path / "v" / "STOP"), "--ticks", "1", "--interval", "0", *extra]
+
+
+def test_run_one_dry_run_tick_creates_state(tmp_path):
+    code, out, err = run(run_args(tmp_path, team_cfg(tmp_path)), KEYS, lambda *a, **k: RunStub())
+    assert code == 0 and "Équipe : dca" in out and "arrêtée après 1 tick" in out
+    from orchestre.persistence.db import Database as D_
+    from orchestre.persistence.store import Store as S_
+    store = S_(D_(tmp_path / "v" / "o.db"))
+    assert store.load_ledger().account("dca").allocated == D("100")
+    assert store.load_state("dca")["last_slot"] is not None  # le DCA a avancé son calendrier (dry-run)
+
+
+def test_run_requires_a_positive_capital_cap(tmp_path):
+    code, _, err = run(run_args(tmp_path, team_cfg(tmp_path, cap="0")), KEYS, lambda *a, **k: RunStub())
+    assert code == 2 and "max_total_capital_quote" in err
+
+
+def test_run_without_any_enabled_strategy_is_refused(tmp_path):
+    cfg = write_cfg(tmp_path, 'max_total_capital_quote = "500"\n')
+    code, _, err = run(run_args(tmp_path, cfg), KEYS, lambda *a, **k: RunStub())
+    assert code == 2 and "aucune stratégie" in err
+
+
+def test_run_refuses_a_changed_capital_cap_against_stored_ledger(tmp_path):
+    run(run_args(tmp_path, team_cfg(tmp_path)), KEYS, lambda *a, **k: RunStub())
+    code, _, err = run(run_args(tmp_path, team_cfg(tmp_path, cap="800")), KEYS, lambda *a, **k: RunStub())
+    assert code == 2 and "plafond" in err
+
+
+def test_run_stops_immediately_when_stop_file_exists(tmp_path):
+    (tmp_path / "v").mkdir()
+    (tmp_path / "v" / "STOP").write_text("")
+    code, out, _ = run(run_args(tmp_path, team_cfg(tmp_path)), KEYS, lambda *a, **k: RunStub())
+    assert code == 0 and "arrêtée après 1 tick" in out
+
+
+LIVE_KEYS = {"BINANCE_LIVE_API_KEY": "lk", "BINANCE_LIVE_API_SECRET": "ls"}
+
+
+def live_stub():
+    stub = RunStub()
+    stub.restrictions = GOOD
+    return stub
+
+
+def test_live_run_refused_without_written_decision(tmp_path):
+    cfg = team_cfg(tmp_path, env="live")
+    args = run_args(tmp_path, cfg, "--live", "--decision-file", str(tmp_path / "absent.md"))
+    code, _, err = run(args, LIVE_KEYS, lambda *a, **k: live_stub())
+    assert code == 5 and "décision écrite absente" in err
+
+
+def test_live_run_refused_with_dangerous_key_even_with_decision(tmp_path):
+    decision = tmp_path / "decision-live.md"
+    decision.write_text("décision du 2026-10-20")
+    stub = RunStub()
+    stub.restrictions = {**GOOD, "enableWithdrawals": True}
+    args = run_args(tmp_path, team_cfg(tmp_path, env="live"), "--live", "--decision-file", str(decision))
+    code, _, err = run(args, LIVE_KEYS, lambda *a, **k: stub)
+    assert code == 3 and "retraits" in err
+
+
+def test_live_run_proceeds_only_with_decision_and_safe_key(tmp_path):
+    decision = tmp_path / "decision-live.md"
+    decision.write_text("décision du 2026-10-20")
+    args = run_args(tmp_path, team_cfg(tmp_path, env="live"), "--live", "--decision-file", str(decision))
+    code, out, _ = run(args, LIVE_KEYS, lambda *a, **k: live_stub())
+    assert code == 0 and "ARGENT RÉEL" in out
+
+
+def test_cancel_all_cancels_open_orders(tmp_path):
+    stub = RunStub()
+    stub.open_orders = [order(status="NEW", cid="a", price="59000")]
+    stub.next_order = order(status="CANCELED", cid="x", extra={"origClientOrderId": "a"})
+    code, out, _ = run(["cancel-all", "--config", EXAMPLE, "--symbol", "BTCUSDT"], KEYS, lambda *a, **k: stub)
+    assert code == 0 and "1 ordre" in out

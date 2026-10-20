@@ -14,6 +14,7 @@ import ccxt
 from orchestre.config import ConfigError, Env
 from orchestre.exchange.base import Exchange, OrderRequest, OrderResult
 from orchestre.exchange.filters import Side, SymbolFilters
+from orchestre.exchange.ratelimit import RateLimiter
 
 _STATUS = {
     "NEW": "NEW",
@@ -36,7 +37,7 @@ def create_client(env: Env, api_key: str, api_secret: str, live_confirmed: bool 
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
+            "options": {"defaultType": "spot", "recvWindow": 5000, "adjustForTimeDifference": True},
         }
     )
     if env is Env.TESTNET:
@@ -47,11 +48,25 @@ def create_client(env: Env, api_key: str, api_secret: str, live_confirmed: bool 
 
 
 class BinanceExchange(Exchange):
-    def __init__(self, client, quote: str = "USDT", fee_rate: Decimal = Decimal("0.001")) -> None:
+    def __init__(
+        self,
+        client,
+        quote: str = "USDT",
+        fee_rate: Decimal = Decimal("0.001"),
+        limiter: RateLimiter | None = None,
+    ) -> None:
         self._client = client
         self._quote = quote
         self._fee_rate = fee_rate
         self._markets_loaded = False
+        self._call = (limiter or RateLimiter(headers=self._response_headers)).call
+
+    def _response_headers(self) -> dict:
+        return getattr(self._client, "last_response_headers", None) or {}
+
+    def sync_time(self):
+        """Synchronise l'horloge avec le serveur (EX-EX-08)."""
+        return self._call(self._client.load_time_difference)
 
     # --- lecture ---
     def get_filters(self, symbol: str) -> SymbolFilters:
@@ -69,26 +84,26 @@ class BinanceExchange(Exchange):
         )
 
     def get_price(self, symbol: str) -> Decimal:
-        return Decimal(self._client.fetch_ticker(self._pair(symbol))["info"]["lastPrice"])
+        return Decimal(self._call(self._client.fetch_ticker, self._pair(symbol))["info"]["lastPrice"])
 
     def get_balances(self) -> dict[str, Decimal]:
-        balances = self._client.fetch_balance()["info"]["balances"]
+        balances = self._call(self._client.fetch_balance)["info"]["balances"]
         free = {b["asset"]: Decimal(b["free"]) for b in balances}
         return {asset: amount for asset, amount in free.items() if amount > 0}
 
     def fetch_key_restrictions(self) -> dict:
         """Permissions de la clé (`/sapi`, réel uniquement : absent du testnet, EX-SEC-05)."""
-        return dict(self._client.sapiGetAccountApiRestrictions())
+        return dict(self._call(self._client.sapiGetAccountApiRestrictions))
 
     def get_order(self, symbol: str, client_order_id: str) -> OrderResult | None:
         try:
-            raw = self._client.fetch_order(None, self._pair(symbol), {"origClientOrderId": client_order_id})
+            raw = self._call(self._client.fetch_order, None, self._pair(symbol), {"origClientOrderId": client_order_id})
         except ccxt.OrderNotFound:
             return None
         return self._to_result(raw, symbol)
 
     def get_open_orders(self, symbol: str) -> list[OrderResult]:
-        return [self._to_result(o, symbol) for o in self._client.fetch_open_orders(self._pair(symbol))]
+        return [self._to_result(o, symbol) for o in self._call(self._client.fetch_open_orders, self._pair(symbol))]
 
     # --- écriture (ExecutionAgent uniquement) ---
     def place_order(self, request: OrderRequest) -> OrderResult:
@@ -98,14 +113,15 @@ class BinanceExchange(Exchange):
         else:
             type_, price = "limit", float(request.price)
             params["postOnly"] = True
-        raw = self._client.create_order(
-            self._pair(request.symbol), type_, request.side.value.lower(), float(request.quantity), price, params
+        raw = self._call(
+            self._client.create_order,
+            self._pair(request.symbol), type_, request.side.value.lower(), float(request.quantity), price, params,
         )
         return self._to_result(raw, request.symbol)
 
     def cancel_order(self, symbol: str, client_order_id: str) -> OrderResult:
         try:
-            raw = self._client.cancel_order(None, self._pair(symbol), {"origClientOrderId": client_order_id})
+            raw = self._call(self._client.cancel_order, None, self._pair(symbol), {"origClientOrderId": client_order_id})
         except ccxt.OrderNotFound:
             known = self.get_order(symbol, client_order_id)
             if known is None:
@@ -119,7 +135,7 @@ class BinanceExchange(Exchange):
 
     def _ensure_markets(self) -> None:
         if not self._markets_loaded:
-            self._client.load_markets()
+            self._call(self._client.load_markets)
             self._markets_loaded = True
 
     def _to_result(self, raw: dict, symbol: str, client_order_id: str | None = None) -> OrderResult:

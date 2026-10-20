@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
-from orchestre.exchange.base import Exchange, OrderRequest, OrderResult
+from orchestre.exchange.base import Exchange, IpBannedError, OrderRequest, OrderResult
 from orchestre.exchange.filters import FilterError, Side, round_price, round_qty, validate_order
 from orchestre.portfolio.ledger import Ledger
 from orchestre.risk.engine import ApprovedOrder
@@ -36,6 +36,7 @@ class ExecutionService:
         self._dry_run = dry_run
         self._tracked: dict[tuple[str, str], _Tracked] = {}
         self.consecutive_errors = 0
+        self.orders_sent = 0
 
     # --- envoi ---
     def execute(self, approved: ApprovedOrder, client_order_id: str) -> ExecutionReport:
@@ -65,8 +66,11 @@ class ExecutionService:
             price=price if p.limit_price is not None else None,
             client_order_id=client_order_id,
         )
+        self.orders_sent += 1
         try:
             result = self._exchange.place_order(request)
+        except IpBannedError:
+            raise
         except Exception as exc:
             known = self._exchange.get_order(p.symbol, client_order_id)
             if known is None:
@@ -94,6 +98,12 @@ class ExecutionService:
         }
 
     # --- suivi des ordres en attente ---
+    def open_order_count(self, agent_id: str | None = None, symbol: str | None = None) -> int:
+        return sum(
+            1 for (s, _), t in self._tracked.items()
+            if (agent_id is None or t.agent_id == agent_id) and (symbol is None or s == symbol)
+        )
+
     def open_order_ids(self, symbol: str) -> list[str]:
         return sorted(cid for (s, cid) in self._tracked if s == symbol)
 
