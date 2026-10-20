@@ -15,6 +15,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable, MutableMapping, TextIO
 
+from orchestre.analysis.sentiment import ATTRIBUTION, default_fetch, sentiment_multiplier
+from orchestre.analysis.service import AnalysisService
+from orchestre.analysis.volatility import vol_target_factor
 from orchestre.config import ConfigError, Env, Settings, load_settings
 from orchestre.core.clock import SystemClock
 from orchestre.core.secrets import mask_secrets
@@ -119,8 +122,11 @@ def _cmd_run(args, settings: Settings, environ, out, err, factory) -> int:
         )
     clock = SystemClock()
     alerts = Alerts(clock, store, notifier=lambda level, text: print(f"[{level}] {text}", file=err))
+    analysis = None if args.no_analysis else AnalysisService(exchange, clock, store, fetch_fng=args.fetch_fng)
     try:
-        orch = Orchestrator(settings, exchange, ledger, store, clock, Path(args.stop_file), alerts=alerts)
+        orch = Orchestrator(
+            settings, exchange, ledger, store, clock, Path(args.stop_file), alerts=alerts, analysis=analysis
+        )
         with open(args.config, "rb") as fh:
             added = build_team(tomllib.load(fh), orch, exchange, clock.now())
     except ValueError as exc:
@@ -136,6 +142,42 @@ def _cmd_run(args, settings: Settings, environ, out, err, factory) -> int:
     except KeyboardInterrupt:
         ticks = -1
     print("Équipe arrêtée proprement." if ticks < 0 else f"Équipe arrêtée après {ticks} tick(s).", file=out)
+    return 0
+
+
+def _cmd_analyze(args, settings: Settings, environ, out, err, factory) -> int:
+    """Vue de marché en lecture seule : données publiques, aucune clé nécessaire."""
+    try:
+        key, secret = load_credentials(settings.env, environ)
+    except ConfigError:
+        key, secret = "", ""
+    client = factory(settings.env, key, secret, live_confirmed=settings.env is Env.LIVE)
+    exchange = BinanceExchange(client, quote=settings.quote_currency)
+    service = AnalysisService(exchange, SystemClock(), None, fetch_fng=args.fetch_fng)
+    snap = service.refresh(args.symbol)
+    print(f"{_banner(settings)}\nANALYSE {args.symbol}", file=out)
+    if snap.regime is None:
+        print("Régime : indéterminé (historique insuffisant : au moins 230 bougies journalières requises)", file=out)
+    else:
+        i = snap.reading.indicators
+        print(f"Régime : {snap.regime.value} (confiance {snap.reading.confidence:.0%}, ADX {i['adx']:.1f}, "
+              f"prix {i['close']:.2f}, moyenne 200 j {i['sma_slow']:.2f})", file=out)
+    print("Données : " + ("cohérentes" if snap.healthy else "SUSPECTES : " + "; ".join(snap.problems)), file=out)
+    if snap.volatility is not None:
+        v = snap.volatility
+        print(f"Volatilité : ATR(14) {v.atr:.2f}, réalisée 30 j {v.realized:.0%}, prévue {v.forecast:.0%}, "
+              f"facteur de ciblage (cible 40 %) {vol_target_factor(0.40, v.forecast):.2f}", file=out)
+    if snap.liquidity is not None:
+        li = snap.liquidity
+        spread = f"{li.spread_pct:.3%}" if li.spread_pct is not None else "n/a"
+        slip = f"{li.slippage_pct:.3%}" if li.slippage_pct is not None else "n/a"
+        print(f"Liquidité : écart {spread}, glissement estimé {slip} pour 50 {settings.quote_currency} -> {li.reason}", file=out)
+    fng = service.refresh_sentiment()
+    if fng is None:
+        print("Sentiment : indisponible", file=out)
+    else:
+        print(f"Sentiment : {fng.value}/100 ({fng.classification}), multiplicateur d'exposition "
+              f"{sentiment_multiplier(fng.value)}\n{ATTRIBUTION}", file=out)
     return 0
 
 
@@ -177,7 +219,7 @@ def _cmd_status(args, out) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="orchestre")
     sub = p.add_subparsers(dest="command", required=True)
-    for name in ("check-config", "check-keys", "run", "cancel-all"):
+    for name in ("check-config", "check-keys", "run", "cancel-all", "analyze"):
         s = sub.add_parser(name)
         s.add_argument("--config", default="config/settings.toml")
         s.add_argument("--env-file", default=".env")
@@ -188,7 +230,8 @@ def build_parser() -> argparse.ArgumentParser:
             s.add_argument("--decision-file", default="docs/decision-live.md")
             s.add_argument("--ticks", type=int, default=None, help="nombre de ticks puis arrêt (défaut : sans limite)")
             s.add_argument("--interval", type=float, default=30.0, help="secondes entre deux ticks")
-        if name == "cancel-all":
+            s.add_argument("--no-analysis", action="store_true", help="désactive les agents d'analyse")
+        if name in ("cancel-all", "analyze"):
             s.add_argument("--symbol", default=SYMBOL)
     k = sub.add_parser("kill")
     k.add_argument("--stop-file", default="var/STOP")
@@ -203,11 +246,13 @@ def main(
     out: TextIO | None = None,
     err: TextIO | None = None,
     client_factory: Callable | None = None,
+    fetch_fng: Callable | None = None,
 ) -> int:
     out, err = out or sys.stdout, err or sys.stderr
     environ = environ if environ is not None else dict(os.environ)
     factory = client_factory or create_client
     args = build_parser().parse_args(argv)
+    args.fetch_fng = fetch_fng or default_fetch
 
     try:
         if args.command == "kill":
@@ -218,7 +263,7 @@ def main(
         settings = load_settings(args.config, live_flag=args.live)
         handlers = {
             "check-config": _cmd_check_config, "check-keys": _cmd_check_keys,
-            "run": _cmd_run, "cancel-all": _cmd_cancel_all,
+            "run": _cmd_run, "cancel-all": _cmd_cancel_all, "analyze": _cmd_analyze,
         }
         return handlers[args.command](args, settings, environ, out, err, factory)
     except (ConfigError, FileNotFoundError) as exc:

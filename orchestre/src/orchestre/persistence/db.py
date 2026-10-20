@@ -48,6 +48,30 @@ MIGRATIONS: list[str] = [
         content_json text not null
     );
     """,
+    """
+    create table regimes (
+        id integer primary key autoincrement,
+        ts text not null,
+        symbol text not null,
+        regime text not null,
+        confidence real not null,
+        indicators_json text not null
+    );
+    create table volatility (
+        id integer primary key autoincrement,
+        ts text not null,
+        symbol text not null,
+        atr real not null,
+        realized real not null,
+        forecast real not null
+    );
+    create table sentiment (
+        id integer primary key autoincrement,
+        ts text not null,
+        value integer not null,
+        classification text not null
+    );
+    """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 

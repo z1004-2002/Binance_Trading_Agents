@@ -1,0 +1,32 @@
+# Configuration de lancement : TESTNET. Rien ici n'est secret (les clés sont dans .env).
+env = "testnet"
+quote_currency = "USDT"
+max_total_capital_quote = "500"   # plafond global (EX-SEC-11)
+treasury_reserve_pct = "0.20"     # 20 % jamais investis (EX-AL-02)
+dry_run = true                    # true : calcule et journalise, n'envoie AUCUN ordre. Passer à false pour tester les ordres
+
+[risk]
+max_leverage = "1"
+
+# DCA : 20 USDT par semaine. La première échéance est `start` : si elle est passée, l'achat se fait au premier tick.
+[strategies.dca]
+enabled = true
+symbol = "BTCUSDT"
+amount_quote = "20"
+interval_days = 7
+start = "2026-10-20T00:00:00+00:00"
+cumulative_cap = "100"
+missed_policy = "skip"
+modulated = false
+
+# Grid : bornes réglées sur le prix du TESTNET (~81 670 le 20/10/2026), indépendant du marché réel.
+# À recaler si le prix sort de la fourchette.
+[strategies.grid]
+enabled = true
+symbol = "BTCUSDT"
+lower = "75000"
+upper = "88000"
+intervals = 20
+budget_quote = "200"
+fee_rate = "0.001"
+exit_policy = "pause"             # "pause" | "wait" | "close"

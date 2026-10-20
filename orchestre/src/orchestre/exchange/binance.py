@@ -7,12 +7,15 @@ Limite connue : les quantités et prix passent à ccxt sous forme de flottants ;
 
 from __future__ import annotations
 
+import time
+from datetime import datetime, timezone
 from decimal import Decimal
+from typing import Callable
 
 import ccxt
 
 from orchestre.config import ConfigError, Env
-from orchestre.exchange.base import Exchange, OrderRequest, OrderResult
+from orchestre.exchange.base import Candle, Exchange, OrderBook, OrderRequest, OrderResult
 from orchestre.exchange.filters import Side, SymbolFilters
 from orchestre.exchange.ratelimit import RateLimiter
 
@@ -54,7 +57,9 @@ class BinanceExchange(Exchange):
         quote: str = "USDT",
         fee_rate: Decimal = Decimal("0.001"),
         limiter: RateLimiter | None = None,
+        now_ms: Callable[[], int] = lambda: int(time.time() * 1000),
     ) -> None:
+        self._now_ms = now_ms
         self._client = client
         self._quote = quote
         self._fee_rate = fee_rate
@@ -94,6 +99,24 @@ class BinanceExchange(Exchange):
     def fetch_key_restrictions(self) -> dict:
         """Permissions de la clé (`/sapi`, réel uniquement : absent du testnet, EX-SEC-05)."""
         return dict(self._call(self._client.sapiGetAccountApiRestrictions))
+
+    def get_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]:
+        rows = self._call(self._client.publicGetKlines, {"symbol": symbol, "interval": interval, "limit": limit})
+        now = self._now_ms()
+        to_dt = lambda ms: datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)  # noqa: E731
+        return [
+            Candle(
+                open_time=to_dt(r[0]), close_time=to_dt(r[6]),
+                open=Decimal(r[1]), high=Decimal(r[2]), low=Decimal(r[3]), close=Decimal(r[4]),
+                volume=Decimal(r[5]), closed=int(r[6]) < now,
+            )
+            for r in rows
+        ]
+
+    def get_order_book(self, symbol: str, depth: int = 100) -> OrderBook:
+        raw = self._call(self._client.publicGetDepth, {"symbol": symbol, "limit": depth})
+        parse = lambda side: [(Decimal(p), Decimal(q)) for p, q in raw[side]]  # noqa: E731
+        return OrderBook(bids=parse("bids"), asks=parse("asks"))
 
     def get_order(self, symbol: str, client_order_id: str) -> OrderResult | None:
         try:

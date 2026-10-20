@@ -94,7 +94,29 @@ class Store:
                 ),
             )
 
+    def log_regime(self, ts: datetime, symbol: str, regime: str, confidence: float, indicators: dict) -> None:
+        with self.db.transaction() as c:
+            c.execute(
+                "insert into regimes (ts, symbol, regime, confidence, indicators_json) values (?, ?, ?, ?, ?)",
+                (ts.isoformat(), symbol, regime, confidence, json.dumps(indicators, sort_keys=True)),
+            )
+
+    def log_volatility(self, ts: datetime, symbol: str, atr: float, realized: float, forecast: float) -> None:
+        with self.db.transaction() as c:
+            c.execute(
+                "insert into volatility (ts, symbol, atr, realized, forecast) values (?, ?, ?, ?, ?)",
+                (ts.isoformat(), symbol, atr, realized, forecast),
+            )
+
+    def log_sentiment(self, ts: datetime, value: int, classification: str) -> None:
+        with self.db.transaction() as c:
+            c.execute(
+                "insert into sentiment (ts, value, classification) values (?, ?, ?)",
+                (ts.isoformat(), value, classification),
+            )
+
     def count(self, table: str) -> int:
-        if table not in {"messages", "events", "agent_state", "ledger", "tracked_orders"}:
+        allowed = {"messages", "events", "agent_state", "ledger", "tracked_orders", "regimes", "volatility", "sentiment"}
+        if table not in allowed:
             raise ValueError("table inconnue")
         return self.db.conn.execute(f"select count(*) from {table}").fetchone()[0]

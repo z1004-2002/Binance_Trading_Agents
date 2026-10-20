@@ -13,11 +13,15 @@ EXAMPLE = str(Path(__file__).parents[2] / "config" / "settings.example.toml")
 KEYS = {"BINANCE_TESTNET_API_KEY": "kk-test", "BINANCE_TESTNET_API_SECRET": "ss-test"}
 
 
+FNG = {"data": [{"value": "30", "value_classification": "Fear", "timestamp": "1700000000"}]}
+
+
 def run(argv, environ=None, factory=None):
-    if argv[0] in ("check-config", "check-keys", "run", "cancel-all") and "--env-file" not in argv:
+    if argv[0] in ("check-config", "check-keys", "run", "cancel-all", "analyze") and "--env-file" not in argv:
         argv = [*argv, "--env-file", "/nonexistent/.env"]  # ne jamais lire le vrai .env
     out, err = io.StringIO(), io.StringIO()
-    code = main(argv, environ=environ or {}, out=out, err=err, client_factory=factory)
+    # jamais de réseau dans les tests : la source du sentiment est toujours simulée
+    code = main(argv, environ=environ or {}, out=out, err=err, client_factory=factory, fetch_fng=lambda: FNG)
     return code, out.getvalue(), err.getvalue()
 
 
@@ -264,3 +268,40 @@ def test_cancel_all_cancels_open_orders(tmp_path):
     stub.next_order = order(status="CANCELED", cid="x", extra={"origClientOrderId": "a"})
     code, out, _ = run(["cancel-all", "--config", EXAMPLE, "--symbol", "BTCUSDT"], KEYS, lambda *a, **k: stub)
     assert code == 0 and "1 ordre" in out
+
+
+# --- analyze / analyse dans run ---
+
+def test_analyze_prints_market_view_with_attribution(tmp_path):
+    code, out, _ = run(["analyze", "--config", EXAMPLE, "--symbol", "BTCUSDT"], KEYS, lambda *a, **k: RunStub())
+    assert code == 0
+    assert "Régime" in out and "historique insuffisant" in out
+    assert "Liquidité" in out and "liquide" in out
+    assert "Sentiment" in out and "30" in out and "Alternative.me" in out
+
+
+def test_analyze_works_without_keys_on_public_data():
+    code, out, _ = run(["analyze", "--config", EXAMPLE], {}, lambda *a, **k: RunStub())
+    assert code == 0 and "Liquidité" in out
+
+
+def test_analyze_reports_unavailable_sentiment():
+    out, err = io.StringIO(), io.StringIO()
+    code = main(["analyze", "--config", EXAMPLE, "--env-file", "/nonexistent/.env"], environ={}, out=out, err=err,
+                client_factory=lambda *a, **k: RunStub(), fetch_fng=lambda: (_ for _ in ()).throw(OSError("réseau")))
+    assert code == 0 and "indisponible" in out.getvalue()
+
+
+def test_run_with_analysis_logs_market_data(tmp_path):
+    code, out, _ = run(run_args(tmp_path, team_cfg(tmp_path)), KEYS, lambda *a, **k: RunStub())
+    assert code == 0
+    from orchestre.persistence.db import Database as D_
+    from orchestre.persistence.store import Store as S_
+    assert S_(D_(tmp_path / "v" / "o.db")).count("sentiment") == 1
+
+
+def test_run_without_analysis_flag_skips_market_analysis(tmp_path):
+    code, _, _ = run(run_args(tmp_path, team_cfg(tmp_path), "--no-analysis"), KEYS, lambda *a, **k: RunStub())
+    from orchestre.persistence.db import Database as D_
+    from orchestre.persistence.store import Store as S_
+    assert code == 0 and S_(D_(tmp_path / "v" / "o.db")).count("sentiment") == 0

@@ -70,6 +70,18 @@ class StubClient:
     def fetch_open_orders(self, symbol):
         return self.open_orders
 
+    def publicGetKlines(self, params):
+        self.calls.append(("klines", params))
+        day = 86_400_000
+        return [
+            [0, "100.0", "110.0", "95.0", "105.0", "12.5", day - 1, "0", 1, "0", "0", "0"],
+            [day, "105.0", "108.0", "101.0", "103.0", "9.0", 2 * day - 1, "0", 1, "0", "0", "0"],
+        ]
+
+    def publicGetDepth(self, params):
+        self.calls.append(("depth", params))
+        return {"bids": [["59990.00", "1.5"], ["59980.00", "2"]], "asks": [["60010.00", "1"], ["60020.00", "3"]]}
+
     def cancel_order(self, id_, symbol, params=None):
         self.calls.append(("cancel_order", id_, symbol, params))
         if self.cancel_error:

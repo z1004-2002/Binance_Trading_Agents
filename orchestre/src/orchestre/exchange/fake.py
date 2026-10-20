@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from orchestre.exchange.base import Exchange, OrderRequest, OrderResult
+from orchestre.exchange.base import Candle, Exchange, OrderBook, OrderRequest, OrderResult
 from orchestre.exchange.filters import FilterError, Side, SymbolFilters, validate_order
 
 
@@ -28,6 +28,8 @@ class FakeExchange(Exchange):
         self._quote = quote
         self._orders: dict[tuple[str, str], OrderResult] = {}
         self._resting: dict[tuple[str, str], OrderRequest] = {}
+        self._candles: dict[tuple[str, str], list[Candle]] = {}
+        self._books: dict[str, OrderBook] = {}
 
     # --- scénario ---
     def set_price(self, symbol: str, price: Decimal) -> list[OrderResult]:
@@ -42,7 +44,26 @@ class FakeExchange(Exchange):
                 filled.append(self._fill_resting(key, req))
         return filled
 
+    def set_candles(self, symbol: str, interval: str, candles: list[Candle]) -> None:
+        self._candles[(symbol, interval)] = list(candles)
+
+    def set_order_book(self, symbol: str, book: OrderBook) -> None:
+        self._books[symbol] = book
+
     # --- lecture ---
+    def get_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]:
+        return self._candles.get((symbol, interval), [])[-limit:]
+
+    def get_order_book(self, symbol: str, depth: int = 100) -> OrderBook:
+        if symbol in self._books:
+            return self._books[symbol]
+        mid = self._prices[symbol]  # carnet profond et serré par défaut
+        step = mid * Decimal("0.0001")
+        return OrderBook(
+            bids=[(mid - step * (i + 1), Decimal("10")) for i in range(depth)],
+            asks=[(mid + step * (i + 1), Decimal("10")) for i in range(depth)],
+        )
+
     def get_filters(self, symbol: str) -> SymbolFilters:
         return self._filters[symbol]
 

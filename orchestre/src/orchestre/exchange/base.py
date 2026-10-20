@@ -4,9 +4,28 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 
 from orchestre.exchange.filters import Side, SymbolFilters
+
+
+@dataclass(frozen=True)
+class Candle:
+    open_time: datetime
+    close_time: datetime
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal
+    closed: bool
+
+
+@dataclass(frozen=True)
+class OrderBook:
+    bids: list[tuple[Decimal, Decimal]]  # (prix, quantité), du meilleur au pire
+    asks: list[tuple[Decimal, Decimal]]
 
 
 class IpBannedError(RuntimeError):
@@ -50,6 +69,12 @@ class Exchange(ABC):
 
     @abstractmethod
     def get_open_orders(self, symbol: str) -> list[OrderResult]: ...
+
+    @abstractmethod
+    def get_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]: ...
+
+    @abstractmethod
+    def get_order_book(self, symbol: str, depth: int = 100) -> OrderBook: ...
 
     # --- écriture (ExecutionAgent uniquement) ---
     @abstractmethod

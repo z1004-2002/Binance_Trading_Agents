@@ -13,12 +13,15 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from orchestre.analysis.regimes import Regime
+from orchestre.analysis.service import AnalysisService
 from orchestre.config import Settings
 from orchestre.core.agent import Agent, AgentState
 from orchestre.core.clock import Clock
 from orchestre.exchange.base import Exchange, IpBannedError
 from orchestre.execution.service import ExecutionService
 from orchestre.persistence.store import Store
+from orchestre.portfolio.allocator import StrategyBudget, apply_allocations, compute_allocations, min_viable_budget
 from orchestre.portfolio.ledger import Ledger
 from orchestre.risk.models import OrderProposal, RiskContext
 from orchestre.runtime.alerts import Alerts
@@ -88,6 +91,11 @@ class _Unit:
         self.runner, self._grid_cfg, self.budget = runner, grid_cfg, budget
         self.started = False
         self.errors = 0
+        self.fear_greed: int | None = None
+
+    @property
+    def grid_cfg(self) -> GridConfig | None:
+        return self._grid_cfg
 
     def tick(self, now: datetime, price: Decimal) -> None:
         if self.kind == "grid":
@@ -96,7 +104,7 @@ class _Unit:
                 self.started = True
             self.runner.step(price)
         else:
-            self.runner.step(now, price)
+            self.runner.step(now, price, self.fear_greed)
 
     def export_state(self) -> dict:
         state = self.runner.export_state()
@@ -119,6 +127,8 @@ class Orchestrator:
         stop_file: Path,
         limits: RuntimeLimits | None = None,
         alerts: Alerts | None = None,
+        analysis: AnalysisService | None = None,
+        reference_symbol: str | None = None,
     ) -> None:
         if settings.max_total_capital_quote <= 0:
             raise ValueError("max_total_capital_quote doit être > 0 pour lancer l'équipe (EX-SEC-11)")
@@ -126,6 +136,11 @@ class Orchestrator:
         self.store, self.clock, self.stop_file = store, clock, stop_file
         self.limits = limits or RuntimeLimits()
         self.alerts = alerts or Alerts(clock, store)
+        self.analysis, self.reference_symbol = analysis, reference_symbol
+        self._regime: Regime | None = None
+        self._liquid: dict[str, bool] = {}
+        self._fear_greed: int | None = None
+        self._reported_problems: dict[str, tuple] = {}
         self.svc = ExecutionService(exchange, ledger, dry_run=settings.dry_run)
         self.supervisor = Supervisor(clock, stop_file, self.limits.heartbeat_timeout)
         self.state = RuntimeState()
@@ -183,8 +198,6 @@ class Orchestrator:
     # --- contexte de risque (instantané du tick) ---
     def _context_factory(self, agent_id: str, symbol: str, max_deviation: Decimal) -> Callable[[OrderProposal], RiskContext]:
         def build(_proposal: OrderProposal) -> RiskContext:
-            if symbol not in self._filters:
-                self._filters[symbol] = self.exchange.get_filters(symbol)
             committed = sum((a.committed for a in self.ledger.accounts()), Decimal("0"))
             symbol_committed = sum(
                 (self.ledger.account(u.agent_id).committed for u in self.units.values() if u.symbol == symbol),
@@ -197,9 +210,9 @@ class Orchestrator:
                 agent_budget_available=self.ledger.account(agent_id).available,
                 total_committed_quote=committed, balance_quote=self._quote_balance,
                 capital_quote=self.settings.max_total_capital_quote,
-                last_price=self._prices[symbol], min_notional=self._filters[symbol].min_notional,
+                last_price=self._prices[symbol], min_notional=self._symbol_filters(symbol).min_notional,
                 max_order_notional=self.limits.max_order_notional, max_price_deviation_pct=max_deviation,
-                pair_liquid=True, pair_allowed=symbol in {u.symbol for u in self.units.values()},
+                pair_liquid=self._liquid.get(symbol, True), pair_allowed=symbol in {u.symbol for u in self.units.values()},
                 asset_exposure_quote=symbol_committed, total_crypto_exposure_quote=committed,
                 open_orders_agent=self.svc.open_order_count(agent_id),
                 max_open_orders_agent=self.limits.max_open_orders_agent,
@@ -213,6 +226,11 @@ class Orchestrator:
             )
 
         return build
+
+    def _symbol_filters(self, symbol: str):
+        if symbol not in self._filters:
+            self._filters[symbol] = self.exchange.get_filters(symbol)
+        return self._filters[symbol]
 
     # --- reprise ---
     def restore(self) -> None:
@@ -262,6 +280,12 @@ class Orchestrator:
             self._reduce_budgets()
 
         try:
+            self._analyze(symbols)
+        except IpBannedError as exc:
+            self._pause_all(f"adresse IP bannie (418) : {exc}")
+            return "PAUSED"
+
+        try:
             for agent_id, unit in self.units.items():
                 if self.unit_agents[agent_id].state is not AgentState.RUNNING:
                     continue
@@ -277,6 +301,49 @@ class Orchestrator:
                 self._pause_all("écart de réconciliation : " + "; ".join(gaps))
                 return self._finish("PAUSED", now)
         return self._finish("OK", now)
+
+    # --- analyse de marché (§10) ---
+    def _analyze(self, symbols: list[str]) -> None:
+        if self.analysis is None:
+            return
+        try:
+            snapshots = {s: self.analysis.refresh(s) for s in symbols}
+            sentiment = self.analysis.refresh_sentiment()
+        except IpBannedError:
+            raise
+        except Exception as exc:  # l'analyse est un capteur : sa panne ne doit pas arrêter l'équipe
+            self.alerts.send("WARNING", f"analyse indisponible : {exc!r}")
+            return
+        self._fear_greed = sentiment.value if sentiment is not None else None
+        for unit in self.units.values():
+            unit.fear_greed = self._fear_greed
+        for symbol, snap in snapshots.items():
+            self._liquid[symbol] = snap.liquidity.liquid if snap.liquidity is not None else True
+            problems = tuple(snap.problems)
+            if problems != self._reported_problems.get(symbol, ()):
+                self._reported_problems[symbol] = problems
+                if problems:
+                    self.alerts.send("WARNING", f"données d'analyse suspectes sur {symbol} : {'; '.join(problems)}")
+        reference = snapshots.get(self.reference_symbol or symbols[0]) if symbols else None
+        if reference and reference.healthy and reference.regime is not None and reference.regime is not self._regime:
+            self._regime = reference.regime
+            self._apply_regime(reference.regime)
+
+    def _apply_regime(self, regime: Regime) -> None:
+        """Budgets fixes x multiplicateur de régime (§12.1) : peut seulement réduire, jamais dépasser le budget configuré."""
+        configs = []
+        for unit in self.units.values():
+            if unit.kind == "grid":
+                strategy = "S-2"
+                minimum = min_viable_budget(unit.grid_cfg.intervals, unit.grid_cfg.min_notional)
+            else:
+                strategy, minimum = "S-1", self._symbol_filters(unit.symbol).min_notional
+            base = unit.budget / 2 if self.state.tier1_applied else unit.budget
+            configs.append(StrategyBudget(unit.agent_id, strategy, base, minimum))
+        allocations = compute_allocations(configs, regime, self.ledger.total, self.settings.treasury_reserve_pct)
+        apply_allocations(self.ledger, allocations)
+        detail = ", ".join(f"{aid}={a.budget} ({a.status})" for aid, a in allocations.items())
+        self.alerts.send("INFO", f"régime {regime.value} : budgets {detail}")
 
     def _tick_unit(self, agent_id: str, unit: _Unit, now: datetime) -> None:
         try:
