@@ -1,0 +1,19 @@
+# Configuration globale (EX-SEC-01, A-8). Environnement par défaut : testnet.
+env = "testnet"                  # "testnet" | "demo" | "live"
+quote_currency = "USDT"
+max_total_capital_quote = "500"  # plafond global (EX-SEC-11), en chaîne : décimal exact
+treasury_reserve_pct = "0.20"    # réserve de trésorerie (EX-AL-02)
+dry_run = true                   # EX-SEC-17
+
+[risk]
+max_leverage = "1"               # EX-SEC-20 : ×1 = pas de levier
+max_exposure_per_asset_pct = "0.40"   # R-09
+max_crypto_exposure_pct = "0.80"      # R-10
+
+# Instruments avancés : désactivés par défaut (EX-PER-01).
+[instruments.futures]
+enabled = false
+[instruments.margin]
+enabled = false
+[instruments.earn]
+enabled = false
