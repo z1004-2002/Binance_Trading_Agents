@@ -65,5 +65,8 @@ class SentimentState:
     def pause_pair(self, pair: str, reason: str) -> None:
         self.reasons[pair] = reason
 
+    def resume_pair(self, pair: str) -> None:
+        self.reasons.pop(pair, None)
+
     def is_paused(self, pair: str) -> bool:
         return pair in self.reasons

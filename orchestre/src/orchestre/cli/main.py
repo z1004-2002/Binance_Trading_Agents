@@ -16,6 +16,14 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable, MutableMapping, TextIO
 
+from orchestre.assistant.agent import AssistantAgent, BudgetExceeded
+from orchestre.assistant.groq import GroqClient, GroqError, default_post as groq_default_post
+from orchestre.assistant.news import default_fetch as news_default_fetch, pairs_to_pause, parse_rss
+from orchestre.assistant.tools import ToolBox
+from orchestre.assistant.worker import run_worker
+from orchestre.dashboard.data import DashboardData
+from orchestre.audit.legacy import SEVERITIES, render_markdown, scan
+from orchestre.dashboard.server import DashboardServer
 from orchestre.cli.backtest_cmds import (
     DEFAULT_UNIVERSE, WALKFORWARD, cmd_backtest, cmd_portfolio_backtest, cmd_team_backtest, cmd_walkforward,
 )
@@ -26,6 +34,7 @@ from orchestre.config import ConfigError, Env, Settings, load_settings
 from orchestre.core.clock import SystemClock
 from orchestre.core.secrets import mask_secrets
 from orchestre.exchange.paper import PaperExchange
+from orchestre.notify.telegram import default_post, from_env as telegram_from_env
 from orchestre.exchange.binance import BinanceExchange, create_client, create_public_client
 from orchestre.exchange.credentials import load_credentials
 from orchestre.exchange.key_restrictions import check_key_restrictions
@@ -40,8 +49,10 @@ from orchestre.runtime.orchestrator import Orchestrator
 SYMBOL = "BTCUSDT"
 
 
-def load_env_file(path: Path, environ: MutableMapping[str, str]) -> None:
-    """Lit un fichier .env sans écraser l'environnement réel ; ne journalise aucune valeur."""
+def load_env_file(path: Path, environ: MutableMapping[str, str], only: set[str] | None = None) -> None:
+    """Lit un fichier .env sans écraser l'environnement réel ; ne journalise aucune valeur.
+
+    `only` limite les variables lues (le tableau de bord ne charge jamais de clé d'exchange ni de LLM, EX-UI-08)."""
     if not path.exists():
         return
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -49,7 +60,8 @@ def load_env_file(path: Path, environ: MutableMapping[str, str]) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        environ.setdefault(key.strip(), value.strip().strip("'\""))
+        if only is None or key.strip() in only:
+            environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
 def _banner(s: Settings) -> str:
@@ -149,7 +161,14 @@ def _cmd_run(args, settings: Settings, environ, out, err, factory) -> int:
             "toute modification du plafond exige une validation humaine (C-08), repartir d'une base neuve"
         )
     clock = SystemClock()
-    alerts = Alerts(clock, store, notifier=lambda level, text: print(f"[{level}] {text}", file=err))
+    telegram = telegram_from_env(environ, post=args.telegram_post)
+
+    def notify(level: str, text: str) -> None:
+        print(f"[{level}] {text}", file=err)
+        if telegram is not None:
+            telegram(level, text)       # alertes hors machine (EX-NOT-01)
+
+    alerts = Alerts(clock, store, notifier=notify)
     analysis = None if args.no_analysis else AnalysisService(exchange, clock, store, fetch_fng=args.fetch_fng)
     try:
         orch = Orchestrator(
@@ -216,6 +235,119 @@ def _cmd_cancel_all(args, settings: Settings, environ, out, err, factory) -> int
     service = ExecutionService(exchange, Ledger(Decimal("0")), dry_run=False)
     reports = service.cancel_all_open(args.symbol, keep_protective=False)
     print(f"{len(reports)} ordre(s) annulé(s) sur {args.symbol}.", file=out)
+    return 0
+
+
+def _cmd_audit_legacy(args, out, err) -> int:
+    """Phase 0 : audit statique de l'existant (EX-ST-07). N'affiche et n'écrit jamais de secret."""
+    root = Path(args.path)
+    if not root.is_dir():
+        print(f"Dossier introuvable : {root}", file=err)
+        return 2
+    report = scan(root)
+    target = Path(args.output)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(render_markdown(report, SystemClock().now()), encoding="utf-8")
+    counts = {s: sum(f.severity == s for f in report.findings) for s in SEVERITIES}
+    print(f"Audit de {root} : {len(report.files)} fichier(s) Python, {report.loc} ligne(s), "
+          f"{len(report.agent_classes)} classe(s) d'agent.", file=out)
+    print("Constats : " + ", ".join(f"{counts[s]} {s}" for s in SEVERITIES) + f". Rapport : {target}", file=out)
+    if counts["CRITIQUE"]:
+        print("ATTENTION : constat(s) CRITIQUE(S) (clé en clair ou retrait) : voir le rapport, révoquer les clés concernées.", file=out)
+    return 0
+
+
+def _cmd_dashboard(args, environ, out, err) -> int:
+    """Tableau de bord local (127.0.0.1) : lecture seule de la base, aucune clé d'exchange ni de LLM (EX-UI-08)."""
+    secrets_env: dict[str, str] = {k: v for k, v in environ.items() if k == "DASHBOARD_PASSWORD"}
+    load_env_file(Path(args.env_file), secrets_env, only={"DASHBOARD_PASSWORD"})
+    password = secrets_env.get("DASHBOARD_PASSWORD", "")
+    if not password:
+        raise ConfigError("DASHBOARD_PASSWORD manquant : le définir dans .env (8 caractères minimum)")
+    if not Path(args.db).exists():
+        raise ConfigError(f"base introuvable : {args.db} (lancer d'abord `run` ou `run --paper`)")
+    try:
+        server = DashboardServer(args.db, args.stop_file, password, port=args.port)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+    url = f"http://127.0.0.1:{server.port}"
+    if args.check:
+        server.httpd.server_close()
+        print(f"Tableau de bord prêt : {url} (vérification seulement, non démarré).", file=out)
+        return 0
+    print(f"Tableau de bord : {url}  (Ctrl+C pour arrêter). Accès distant : tunnel SSH, jamais d'exposition publique.", file=out)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.httpd.server_close()
+    return 0
+
+
+ASSISTANT_ENV = {"GROQ_API_KEY", "GROQ_MODEL", "GROQ_MONTHLY_TOKEN_BUDGET", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"}
+
+
+def _build_assistant(args, environ) -> tuple[AssistantAgent, Store, dict]:
+    """L'assistant est le seul à détenir la clé Groq (EX-UI-08) ; on ne charge que les variables qui le concernent."""
+    env = {k: v for k, v in environ.items() if k in ASSISTANT_ENV}
+    load_env_file(Path(args.env_file), env, only=ASSISTANT_ENV)
+    if not Path(args.db).exists():
+        raise ConfigError(f"base introuvable : {args.db}")
+    try:
+        client = GroqClient(env.get("GROQ_API_KEY", ""), env.get("GROQ_MODEL", ""), post=args.groq_post)
+    except GroqError as exc:
+        raise ConfigError(str(exc)) from exc
+    budget = int(env.get("GROQ_MONTHLY_TOKEN_BUDGET", "200000"))
+    clock = SystemClock()
+    store = Store(Database(args.db))
+    tools = ToolBox(DashboardData(args.db, getattr(args, "stop_file", "var/STOP")), store, clock.now, budget)
+    return AssistantAgent(client, tools, store, clock.now, budget, env["GROQ_MODEL"]), store, env
+
+
+def _cmd_assistant(args, environ, out, err) -> int:
+    assistant, store, env = _build_assistant(args, environ)
+    if args.assistant_command == "ask":
+        try:
+            print(assistant.ask(args.question), file=out)
+        except (GroqError, BudgetExceeded) as exc:
+            print(f"Assistant indisponible : {mask_secrets(str(exc))}", file=err)
+            return 4
+        return 0
+    if args.assistant_command == "report":
+        report = assistant.daily_report()
+        print(report, file=out)
+        telegram = telegram_from_env(env, post=args.telegram_post) if args.telegram else None
+        if telegram is not None:
+            telegram("REPORT", report)
+        return 0
+    telegram = telegram_from_env(env, post=args.telegram_post)
+    print("Worker de l'assistant démarré (Ctrl+C pour arrêter).", file=out)
+    try:
+        run_worker(store, assistant, SystemClock().now, notifier=telegram, interval=args.interval, max_loops=args.max_loops,
+                   report_hour=args.report_hour)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+def _cmd_news(args, environ, out, err) -> int:
+    assistant, store, _ = _build_assistant(args, environ)
+    assets = {a.strip().upper() for a in args.assets.split(",") if a.strip()}
+    titles: list[str] = []
+    for url in args.rss:
+        try:
+            titles += parse_rss(args.news_fetch(url))
+        except Exception as exc:
+            print(f"Flux {url} illisible : {mask_secrets(str(exc))}", file=err)
+    if not titles:
+        print("Aucun titre exploitable : rien à classer.", file=out)
+        return 0
+    items = assistant.classify_news(titles, assets)
+    pairs = pairs_to_pause(items)
+    now = SystemClock().now()
+    for pair, reason in pairs.items():
+        store.enqueue_command(now, "pause_pair", f"{pair}|{reason}")
+    print(f"{len(titles)} titre(s) classé(s), {len(items)} valide(s). Paires mises en pause : "
+          f"{', '.join(pairs) if pairs else 'aucune'}.", file=out)
     return 0
 
 
@@ -292,6 +424,33 @@ def build_parser() -> argparse.ArgumentParser:
     tb.add_argument("--symbols", default=DEFAULT_UNIVERSE)
     tb.add_argument("--days", type=int, default=1000)
     market_args(tb)
+    au = sub.add_parser("audit-legacy")
+    au.add_argument("--path", required=True, help="dossier du code existant (copié dans legacy/, sans clé)")
+    au.add_argument("--output", default="docs/audit-existant.md")
+    asst = sub.add_parser("assistant")
+    asst_sub = asst.add_subparsers(dest="assistant_command", required=True)
+    ask = asst_sub.add_parser("ask")
+    ask.add_argument("question")
+    rep = asst_sub.add_parser("report")
+    rep.add_argument("--telegram", action="store_true", help="envoie aussi le rapport par Telegram")
+    wk = asst_sub.add_parser("worker")
+    wk.add_argument("--interval", type=float, default=5.0)
+    wk.add_argument("--report-hour", type=int, default=7, help="heure UTC du rapport quotidien")
+    wk.add_argument("--max-loops", type=int, default=None, help=argparse.SUPPRESS)
+    for sp in (ask, rep, wk):
+        sp.add_argument("--db", default="var/orchestre.db")
+        sp.add_argument("--env-file", default=".env")
+    nw = sub.add_parser("news")
+    nw.add_argument("--db", default="var/orchestre.db")
+    nw.add_argument("--env-file", default=".env")
+    nw.add_argument("--rss", action="append", required=True, help="URL d'un flux RSS ou Atom (répétable)")
+    nw.add_argument("--assets", default="BTC,ETH,SOL,BNB,XRP")
+    ds = sub.add_parser("dashboard")
+    ds.add_argument("--db", default="var/orchestre.db")
+    ds.add_argument("--stop-file", default="var/STOP")
+    ds.add_argument("--port", type=int, default=8765)
+    ds.add_argument("--env-file", default=".env")
+    ds.add_argument("--check", action="store_true", help="vérifie la configuration et s'arrête")
     k = sub.add_parser("kill")
     k.add_argument("--stop-file", default="var/STOP")
     st = sub.add_parser("status")
@@ -307,6 +466,9 @@ def main(
     client_factory: Callable | None = None,
     fetch_fng: Callable | None = None,
     public_client_factory: Callable | None = None,
+    telegram_post: Callable | None = None,
+    groq_post: Callable | None = None,
+    news_fetch: Callable | None = None,
 ) -> int:
     out, err = out or sys.stdout, err or sys.stderr
     environ = environ if environ is not None else dict(os.environ)
@@ -314,6 +476,9 @@ def main(
     args = build_parser().parse_args(argv)
     args.fetch_fng = fetch_fng or default_fetch
     args.public_client_factory = public_client_factory or create_public_client
+    args.telegram_post = telegram_post or default_post
+    args.groq_post = groq_post or groq_default_post
+    args.news_fetch = news_fetch or news_default_fetch
 
     try:
         if args.command == "kill":
@@ -324,6 +489,14 @@ def main(
         }
         if args.command in backtests:
             return backtests[args.command](args, out, err, public_client_factory or create_public_client)
+        if args.command == "assistant":
+            return _cmd_assistant(args, environ, out, err)
+        if args.command == "news":
+            return _cmd_news(args, environ, out, err)
+        if args.command == "dashboard":
+            return _cmd_dashboard(args, environ, out, err)
+        if args.command == "audit-legacy":
+            return _cmd_audit_legacy(args, out, err)
         if args.command == "status":
             return _cmd_status(args, out)
         load_env_file(Path(args.env_file), environ)

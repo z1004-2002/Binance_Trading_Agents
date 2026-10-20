@@ -364,3 +364,145 @@ def test_paper_run_without_any_strategy_is_refused(tmp_path):
     cfg = write_cfg(tmp_path, 'max_total_capital_quote = "500"\n')
     code, _, err = run_paper(paper_args(tmp_path, cfg))
     assert code == 2 and "aucune stratégie" in err
+
+
+def test_critical_alerts_go_to_telegram_when_configured_and_never_when_not(tmp_path):
+    (tmp_path / "v").mkdir()
+    (tmp_path / "v" / "STOP").write_text("")                     # le kill switch déclenche une alerte CRITICAL
+    sent = []
+    env = {**KEYS, "TELEGRAM_BOT_TOKEN": "123456:ABCdefTOKENxyz_1234567890", "TELEGRAM_CHAT_ID": "42"}
+    out, err = io.StringIO(), io.StringIO()
+    code = main(run_args(tmp_path, team_cfg(tmp_path)) + ["--env-file", "/nonexistent/.env"], environ=env, out=out, err=err,
+                client_factory=lambda *a, **k: RunStub(), fetch_fng=lambda: FNG,
+                telegram_post=lambda url, payload: sent.append((url, payload)))
+    assert code == 0 and sent and "kill switch" in sent[0][1]["text"] and sent[0][1]["chat_id"] == "42"
+    assert "ABCdefTOKENxyz_1234567890" not in sent[0][1]["text"] + err.getvalue()
+
+    sent.clear()
+    main(run_args(tmp_path, team_cfg(tmp_path)) + ["--env-file", "/nonexistent/.env"], environ=KEYS, out=io.StringIO(),
+         err=io.StringIO(), client_factory=lambda *a, **k: RunStub(), fetch_fng=lambda: FNG,
+         telegram_post=lambda url, payload: sent.append(1))
+    assert sent == []
+
+
+# --- dashboard ---
+
+def test_dashboard_check_needs_a_password_and_a_database(tmp_path):
+    db = tmp_path / "o.db"
+    Store_ = __import__("orchestre.persistence.store", fromlist=["Store"]).Store
+    Database_ = __import__("orchestre.persistence.db", fromlist=["Database"]).Database
+    Store_(Database_(db))
+    base = ["dashboard", "--db", str(db), "--stop-file", str(tmp_path / "STOP"), "--port", "0", "--check", "--env-file", "/nonexistent/.env"]
+    code, _, err = run(base, {})
+    assert code == 2 and "DASHBOARD_PASSWORD" in err
+    code, _, err = run(base, {"DASHBOARD_PASSWORD": "court"})
+    assert code == 2 and "trop court" in err
+    code, out, _ = run(base, {"DASHBOARD_PASSWORD": "mot-de-passe-solide"})
+    assert code == 0 and "http://127.0.0.1:" in out
+    missing = [*base]
+    missing[2] = str(tmp_path / "absente.db")
+    assert run(missing, {"DASHBOARD_PASSWORD": "mot-de-passe-solide"})[0] == 2
+
+
+def test_the_dashboard_only_reads_its_own_password_from_the_env_file(tmp_path):
+    f = tmp_path / ".env"
+    f.write_text("BINANCE_LIVE_API_KEY=secretlive\nGROQ_API_KEY=gsk_secret\nDASHBOARD_PASSWORD=mot-de-passe-solide\n")
+    env = {}
+    load_env_file(f, env, only={"DASHBOARD_PASSWORD"})
+    assert env == {"DASHBOARD_PASSWORD": "mot-de-passe-solide"}
+
+
+# --- assistant Groq et actualités ---
+
+import json as _json  # noqa: E402
+
+GROQ_ENV = {"GROQ_API_KEY": "gsk_TESTKEYTESTKEYTESTKEYTESTKEY123", "GROQ_MODEL": "modele-choisi", "GROQ_MONTHLY_TOKEN_BUDGET": "100000"}
+
+
+def groq_reply(content, tin=20, tout=10):
+    return {"choices": [{"message": {"role": "assistant", "content": content}}], "usage": {"prompt_tokens": tin, "completion_tokens": tout}}
+
+
+def assistant_db(tmp_path):
+    db = tmp_path / "a.db"
+    Store_ = __import__("orchestre.persistence.store", fromlist=["Store"]).Store
+    Database_ = __import__("orchestre.persistence.db", fromlist=["Database"]).Database
+    store = Store_(Database_(db))
+    store.save_all(__import__("orchestre.portfolio.ledger", fromlist=["Ledger"]).Ledger(D("500")), [], {"runtime_info": {
+        "env": "testnet", "mode": "paper", "dry_run": False, "last_tick": "2026-10-20T12:00:00+00:00", "drawdown": 0.0,
+        "daily_loss": 0.0, "tier": 0, "equity": 500.0, "capital": 500.0, "regime": "RANGE", "kill": False,
+        "agents": {}, "codes": {}}}, datetime(2026, 10, 20, tzinfo=timezone.utc))
+    return db, store
+
+
+def run_assistant(argv, env, responses=None, news=None):
+    posts = list(responses or [])
+    calls = []
+
+    def post(url, headers, body):
+        calls.append(body)
+        return posts.pop(0)
+
+    out, err = io.StringIO(), io.StringIO()
+    code = main(argv + ["--env-file", "/nonexistent/.env"], environ=env, out=out, err=err, groq_post=post,
+                news_fetch=news, telegram_post=lambda *a: None)
+    return code, out.getvalue(), err.getvalue(), calls
+
+
+def test_assistant_ask_prints_the_answer_and_never_leaks_the_key(tmp_path):
+    db, store = assistant_db(tmp_path)
+    code, out, err, calls = run_assistant(["assistant", "ask", "Comment va l'équipe ?", "--db", str(db)], GROQ_ENV, [groq_reply("Tout va bien.")])
+    assert code == 0 and "Tout va bien." in out and GROQ_ENV["GROQ_API_KEY"] not in out + err
+    assert calls[0]["model"] == "modele-choisi"
+    assert store.db.conn.execute("select sum(tokens_in + tokens_out), min(purpose) from llm_calls").fetchone()[:] == (30, "ask")
+
+
+def test_assistant_needs_a_key_and_an_explicit_model(tmp_path):
+    db, _ = assistant_db(tmp_path)
+    code, _, err, _ = run_assistant(["assistant", "ask", "q", "--db", str(db)], {"GROQ_MODEL": "m"})
+    assert code == 2 and "GROQ_API_KEY" in err
+    code, _, err, _ = run_assistant(["assistant", "ask", "q", "--db", str(db)], {"GROQ_API_KEY": "gsk_x" * 8})
+    assert code == 2 and "GROQ_MODEL" in err
+
+
+def test_assistant_report_falls_back_without_llm_when_groq_fails(tmp_path):
+    db, _ = assistant_db(tmp_path)
+    def fail(*a):
+        raise OSError("réseau")
+    out, err = io.StringIO(), io.StringIO()
+    code = main(["assistant", "report", "--db", str(db), "--env-file", "/nonexistent/.env"], environ=GROQ_ENV, out=out, err=err,
+                groq_post=fail, telegram_post=lambda *a: None)
+    assert code == 0 and "sans LLM" in out.getvalue() and "500" in out.getvalue()
+
+
+def test_assistant_worker_answers_queued_questions(tmp_path):
+    db, store = assistant_db(tmp_path)
+    store.enqueue_question(datetime(2026, 10, 20, tzinfo=timezone.utc), "Où en est le drawdown ?")
+    code, out, _, _ = run_assistant(["assistant", "worker", "--db", str(db), "--interval", "0", "--max-loops", "1"], GROQ_ENV,
+                                    [groq_reply("Le drawdown est nul.")] * 3)
+    assert code == 0
+    assert store.recent_questions(1)[0]["answer"] == "Le drawdown est nul."
+
+
+RSS_FEED = "<rss><channel><item><title>Grande plateforme piratée</title></item><item><title>BTC en hausse</title></item></channel></rss>"
+
+
+def test_news_command_queues_a_pause_for_severe_events_only(tmp_path):
+    db, store = assistant_db(tmp_path)
+    classification = _json.dumps({"items": [
+        {"index": 0, "asset": "BTC", "tone": -0.9, "category": "piratage", "severity": 5},
+        {"index": 1, "asset": "BTC", "tone": 0.4, "category": "cotation", "severity": 1},
+    ]})
+    code, out, err, calls = run_assistant(["news", "--db", str(db), "--rss", "https://flux.example/rss", "--assets", "BTC,ETH"],
+                                          GROQ_ENV, [groq_reply(classification)], news=lambda url: RSS_FEED)
+    assert code == 0, err
+    assert calls[0].get("tools") is None and calls[0]["response_format"] == {"type": "json_object"}
+    pending = store.pending_commands()
+    assert [(c["command"], c["target"].split("|")[0]) for c in pending] == [("pause_pair", "BTCUSDT")]
+    assert "BTCUSDT" in out
+
+
+def test_news_with_no_title_does_not_call_the_llm(tmp_path):
+    db, _ = assistant_db(tmp_path)
+    code, out, _, calls = run_assistant(["news", "--db", str(db), "--rss", "https://x/rss"], GROQ_ENV, [], news=lambda url: "pas du xml")
+    assert code == 0 and calls == [] and "aucun titre" in out.lower()

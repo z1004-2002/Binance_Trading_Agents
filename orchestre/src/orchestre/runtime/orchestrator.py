@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from orchestre.analysis.regimes import Regime
+from orchestre.analysis.sentiment import SentimentState
 from orchestre.analysis.service import AnalysisService
 from orchestre.config import Settings
 from orchestre.core.agent import Agent, AgentState
@@ -58,6 +59,8 @@ class RuntimeState:
     day: str | None = None
     day_start_equity: Decimal | None = None
     orders_today: int = 0
+    ref_price0: Decimal | None = None
+    ref_equity0: Decimal | None = None
 
     def to_dict(self) -> dict:
         def s(v):
@@ -67,6 +70,7 @@ class RuntimeState:
             "baseline_value": s(self.baseline_value), "peak_equity": s(self.peak_equity),
             "tier1_applied": self.tier1_applied, "day": self.day,
             "day_start_equity": s(self.day_start_equity), "orders_today": self.orders_today,
+            "ref_price0": s(self.ref_price0), "ref_equity0": s(self.ref_equity0),
         }
 
     @classmethod
@@ -75,7 +79,7 @@ class RuntimeState:
             return None if v is None else Decimal(v)
 
         return cls(dec(d["baseline_value"]), dec(d["peak_equity"]), d["tier1_applied"], d["day"],
-                   dec(d["day_start_equity"]), d["orders_today"])
+                   dec(d["day_start_equity"]), d["orders_today"], dec(d.get("ref_price0")), dec(d.get("ref_equity0")))
 
 
 class _SimpleAgent(Agent):
@@ -181,6 +185,13 @@ class Orchestrator:
         self._startup_done = False
         self._kill_handled = False
         self.run_mode = "exchange"
+        self.sentiment_state = SentimentState()   # paires en pause sur actualité grave : réduction de risque seulement
+        self._equity = Decimal("0")
+        self._last_snapshot: datetime | None = None
+        self._report_due: tuple[str, int] | None = None
+        self._logged_rejections: dict[str, int] = {}
+        self._last_tick: datetime | None = None
+        self.svc.listener = self._log_order
 
     # --- composition de l'équipe ---
     def _reserve_budget(self, agent_id: str, budget: Decimal) -> None:
@@ -266,7 +277,7 @@ class Orchestrator:
                 capital_quote=self.settings.max_total_capital_quote,
                 last_price=self._prices[symbol], min_notional=self._symbol_filters(symbol).min_notional,
                 max_order_notional=self.limits.max_order_notional, max_price_deviation_pct=max_deviation,
-                pair_liquid=self._liquid.get(symbol, True), pair_allowed=symbol in {s for u in self.units.values() for s in u.symbols},
+                pair_liquid=self._liquid.get(symbol, True), pair_allowed=symbol in {s for u in self.units.values() for s in u.symbols} and not self.sentiment_state.is_paused(symbol),
                 asset_exposure_quote=symbol_committed, total_crypto_exposure_quote=committed,
                 open_orders_agent=self.svc.open_order_count(agent_id),
                 max_open_orders_agent=self.limits.max_open_orders_agent,
@@ -286,6 +297,12 @@ class Orchestrator:
             self._filters[symbol] = self.exchange.get_filters(symbol)
         return self._filters[symbol]
 
+    def _log_order(self, agent_id: str, result, note: str) -> None:
+        self.store.log_order(
+            self.clock.now(), agent_id, result.symbol, result.side.value, result.filled_qty or result.orig_qty,
+            result.avg_price, result.fee_quote, result.status, result.client_order_id, note,
+        )
+
     # --- reprise ---
     def restore(self) -> None:
         self.svc.import_tracked(self.store.load_tracked())
@@ -296,6 +313,9 @@ class Orchestrator:
         saved = self.store.load_state("orchestrator")
         if saved is not None:
             self.state = RuntimeState.from_dict(saved)
+        sentiment = self.store.load_state("sentiment_state")
+        if sentiment is not None:
+            self.sentiment_state.reasons = dict(sentiment["reasons"])
         paper = self.store.load_state("paper_exchange")
         if paper is not None and isinstance(self.exchange, PaperExchange):
             self.exchange.import_state(paper)
@@ -303,6 +323,8 @@ class Orchestrator:
     # --- un tick ---
     def run_once(self) -> str:
         now = self.clock.now()
+        self._last_tick = now
+        self._process_commands(now)
         if self.supervisor.kill_switch_active():
             return self._handle_kill("kill switch actif")
 
@@ -328,6 +350,10 @@ class Orchestrator:
                 return "PAUSED"
 
         self._update_equity(now, equity_value)
+        self._snapshot(now, symbols)
+        if self._report_due is not None:
+            self.alerts.send("REPORT", self._daily_report())
+            self._report_due = None
         if self._drawdown >= DRAWDOWN_STOP:
             self.alerts.send("CRITICAL", f"drawdown {self._drawdown:.2%} >= 15 % : arrêt global")
             self.stop_file.parent.mkdir(parents=True, exist_ok=True)
@@ -421,6 +447,7 @@ class Orchestrator:
             unit.errors = 0
             self.supervisor.heartbeat(agent_id)
         self._forward_runner_alerts(agent_id, unit)
+        self._log_new_rejections(agent_id, unit)
 
     def _forward_runner_alerts(self, agent_id: str, unit: _Unit) -> None:
         drain = getattr(unit.runner, "drain_alerts", None)
@@ -464,11 +491,14 @@ class Orchestrator:
         if s.baseline_value is None:
             s.baseline_value = wallet_value
         equity = self.ledger.total + (wallet_value - s.baseline_value)
+        self._equity = equity
         s.peak_equity = max(s.peak_equity or equity, equity)
         self._drawdown = max(Decimal("0"), (s.peak_equity - equity) / s.peak_equity)
         today = now.date().isoformat()
         sent = self.svc.orders_sent
         if s.day != today:
+            if s.day is not None:
+                self._report_due = (s.day, s.orders_today)      # rapport du jour qui se termine (EX-NOT-03)
             s.day, s.day_start_equity, s.orders_today = today, equity, 0
         s.orders_today += sent - self._last_sent
         self._last_sent = sent
@@ -483,6 +513,93 @@ class Orchestrator:
             if half > 0:
                 self.ledger.deallocate(unit.agent_id, half)
         self.alerts.send("WARNING", f"drawdown {self._drawdown:.2%} >= 5 % : budgets réduits de moitié")
+
+    # --- courbes, rapport, commandes, refus du risque ---
+    def _snapshot(self, now: datetime, symbols: list[str]) -> None:
+        if self._last_snapshot is not None and now - self._last_snapshot < timedelta(hours=1):
+            return
+        self._last_snapshot = now
+        self.store.log_equity(now, "TEAM", float(self._equity))
+        reference = self.reference_symbol or (symbols[0] if symbols else None)
+        if reference and reference in self._prices:
+            if self.state.ref_price0 is None:
+                self.state.ref_price0, self.state.ref_equity0 = self._prices[reference], self._equity
+            ref = self.state.ref_equity0 * self._prices[reference] / self.state.ref_price0
+            self.store.log_equity(now, f"REF_{reference}", float(ref))
+        for agent_id, unit in self.units.items():
+            if unit.kind == "exposure":
+                self.store.log_equity(now, f"agent:{agent_id}", float(unit.runner.equity(self._prices[unit.symbol])))
+            elif unit.kind == "portfolio":
+                self.store.log_equity(now, f"agent:{agent_id}", float(unit.runner.equity(self._prices)))
+
+    def _daily_report(self) -> str:
+        day, orders = self._report_due
+        s = self.state
+        pnl = self._equity - (s.day_start_equity or self._equity)
+        positions = [
+            u.agent_id for u in self.units.values() if u.positioned
+        ] or ["aucune"]
+        critical = sum(1 for level, _ in self.alerts.history if level == "CRITICAL")
+        return (
+            f"Rapport du {day} : capital de l'équipe {self._equity:.2f} {self.settings.quote_currency}, "
+            f"drawdown {self._drawdown:.1%}, ordres envoyés ce jour-là {orders}, positions ouvertes : "
+            f"{', '.join(positions)}, alertes critiques cumulées {critical}, mode {self.run_mode}."
+        )
+
+    def _process_commands(self, now: datetime) -> None:
+        for cmd in self.store.pending_commands():
+            status, result = self._apply_command(cmd["command"], cmd["target"])
+            self.store.finish_command(cmd["id"], status, result, now)
+            self.alerts.send("INFO" if status == "done" else "WARNING",
+                             f"commande {cmd['command']} {cmd['target'] or ''} {status} : {result}".replace("  ", " "))
+
+    def _apply_command(self, command: str, target: str | None) -> tuple[str, str]:
+        try:
+            if command == "kill":
+                self.stop_file.parent.mkdir(parents=True, exist_ok=True)
+                self.stop_file.touch()
+                return "done", "kill switch activé (fichier STOP créé)"
+            if command in ("pause_pair", "resume_pair"):
+                pair, _, reason = (target or "").partition("|")
+                known = {sym for u in self.units.values() for sym in u.symbols}
+                if pair not in known:
+                    return "refused", f"paire inconnue de l'équipe : {pair or '?'}"
+                if command == "pause_pair":
+                    self.sentiment_state.pause_pair(pair, reason or "actualité grave")
+                    return "done", f"{pair} en pause (aucun nouvel achat) : {reason or 'actualité grave'}"
+                self.sentiment_state.resume_pair(pair)
+                return "done", f"{pair} reprise"
+            if command not in ("pause", "resume"):
+                return "refused", f"commande inconnue : {command}"
+            targets = list(self.unit_agents) if target in (None, "", "all") else [target]
+            unknown = [t for t in targets if t not in self.unit_agents]
+            if unknown:
+                return "refused", f"agent inconnu : {', '.join(unknown)}"
+            for t in targets:
+                self.supervisor.apply_command(command, t)
+            return "done", f"{command} : {', '.join(targets)}"
+        except PermissionError as exc:
+            return "refused", str(exc)
+
+    def _log_new_rejections(self, agent_id: str, unit: _Unit) -> None:
+        rejections = getattr(unit.runner, "rejections", [])
+        for decision in rejections[self._logged_rejections.get(agent_id, 0):]:
+            self.store.log_event(self.clock.now(), "INFO", "risk", f"{agent_id} refusé par {decision.rule_id} : {decision.reason}")
+        self._logged_rejections[agent_id] = len(rejections)
+
+    def _runtime_info(self) -> dict:
+        tier = 3 if self._drawdown >= DRAWDOWN_STOP else 2 if self._drawdown >= DRAWDOWN_FREEZE else 1 if self._drawdown >= DRAWDOWN_REDUCE else 0
+        return {
+            "env": self.settings.env.value, "mode": self.run_mode, "dry_run": self.settings.dry_run,
+            "last_tick": self._last_tick.isoformat() if self._last_tick else None,
+            "drawdown": float(self._drawdown), "daily_loss": float(self._daily_loss), "tier": tier,
+            "equity": float(self._equity), "capital": float(self.ledger.total),
+            "regime": self._regime.value if self._regime else None, "fear_greed": self._fear_greed,
+            "kill": self.supervisor.kill_switch_active(),
+            "agents": {aid: a.state.value for aid, a in self.unit_agents.items()},
+            "codes": {aid: u.code for aid, u in self.units.items()},
+            "paused_pairs": dict(self.sentiment_state.reasons),
+        }
 
     # --- arrêts ---
     def _pause_all(self, reason: str) -> None:
@@ -506,6 +623,8 @@ class Orchestrator:
         states = {aid: u.export_state() for aid, u in self.units.items()}
         states["orchestrator"] = self.state.to_dict()
         states["run_mode"] = {"mode": self.run_mode}
+        states["runtime_info"] = self._runtime_info()
+        states["sentiment_state"] = {"reasons": dict(self.sentiment_state.reasons)}
         if isinstance(self.exchange, PaperExchange):
             states["paper_exchange"] = self.exchange.export_state()
         self.store.save_all(self.ledger, self.svc.export_tracked(), states, now)

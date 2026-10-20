@@ -38,6 +38,7 @@ class ExecutionService:
         self._tracked: dict[tuple[str, str], _Tracked] = {}
         self.consecutive_errors = 0
         self.orders_sent = 0
+        self.listener = None  # appelé (agent_id, résultat, note) à chaque événement d'ordre : journal d'audit
 
     # --- envoi ---
     def execute(self, approved: ApprovedOrder, client_order_id: str) -> ExecutionReport:
@@ -160,6 +161,13 @@ class ExecutionService:
         return gaps
 
     # --- interne ---
+    def _notify(self, agent_id: str, result: OrderResult | None, note: str) -> None:
+        if self.listener is not None and result is not None:
+            try:
+                self.listener(agent_id, result, note)
+            except Exception:  # le journal ne doit jamais gêner l'exécution
+                pass
+
     def _settle(self, approved: ApprovedOrder, result: OrderResult, note: str) -> ExecutionReport:
         p = approved.proposal
         key = (result.symbol, result.client_order_id)
@@ -170,6 +178,7 @@ class ExecutionService:
                     committed = result.orig_qty * result.avg_price + p.est_fee
                     self._ledger.commit(p.agent_id, committed)
                 self._tracked[key] = _Tracked(p.agent_id, result.side, committed, p.stop_price is not None)
+            self._notify(p.agent_id, result, f"{note}: ordre en attente")
             return ExecutionReport("OPEN", f"{note}: ordre en attente", result)
         if result.status != "FILLED":
             self.consecutive_errors += 1
@@ -178,6 +187,7 @@ class ExecutionService:
         if key in self._tracked:
             return self._close_tracked(result.symbol, result.client_order_id, result)
         self._update_ledger(p.agent_id, result)
+        self._notify(p.agent_id, result, note)
         return ExecutionReport("FILLED", note, result)
 
     def _close_tracked(self, symbol: str, cid: str, result: OrderResult) -> ExecutionReport:
@@ -194,9 +204,11 @@ class ExecutionService:
                     self._ledger.commit(agent, -diff)
             else:
                 self._release_up_to(agent, value)
+            self._notify(agent, result, "ordre en attente exécuté")
             return ExecutionReport("FILLED", "ordre en attente exécuté", result)
         if tracked.committed > 0:
             self._ledger.release(agent, tracked.committed)
+        self._notify(agent, result, "ordre en attente clos")
         return ExecutionReport(result.status, "ordre en attente clos", result)
 
     def _update_ledger(self, agent: str, r: OrderResult) -> None:

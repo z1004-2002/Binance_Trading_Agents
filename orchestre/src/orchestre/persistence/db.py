@@ -75,6 +75,65 @@ MIGRATIONS: list[str] = [
     """
     alter table tracked_orders add column protective integer not null default 0;
     """,
+    """
+    create table equity_snapshots (
+        id integer primary key autoincrement,
+        ts text not null,
+        series text not null,
+        equity real not null
+    );
+    create index idx_equity_series on equity_snapshots (series, ts);
+    create table order_log (
+        id integer primary key autoincrement,
+        ts text not null,
+        agent_id text not null,
+        symbol text not null,
+        side text not null,
+        qty text not null,
+        price text not null,
+        fee text not null,
+        status text not null,
+        client_order_id text not null,
+        note text not null
+    );
+    create table commands (
+        id integer primary key autoincrement,
+        ts text not null,
+        command text not null,
+        target text,
+        status text not null default 'pending',
+        result text,
+        processed_at text
+    );
+    create table proposals (
+        id integer primary key autoincrement,
+        ts text not null,
+        kind text not null,
+        title text not null,
+        payload_json text not null,
+        status text not null default 'pending',
+        decided_at text
+    );
+    create table assistant_queue (
+        id integer primary key autoincrement,
+        ts text not null,
+        question text not null,
+        status text not null default 'pending',
+        answer text,
+        error text,
+        answered_at text
+    );
+    create table llm_calls (
+        id integer primary key autoincrement,
+        ts text not null,
+        model text not null,
+        purpose text not null,
+        tokens_in integer not null,
+        tokens_out integer not null,
+        duration_ms integer not null,
+        error text
+    );
+    """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 

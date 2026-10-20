@@ -172,3 +172,39 @@ ORCHESTRE_TESTNET=1 ../bin-env/bin/python -m pytest tests/integration_testnet -v
 En mode réel, une stratégie à exposition cible est refusée sans `promoted = true` dans sa section (décision humaine, §14).
 Limites connues : le stop de protection par défaut de S-6/S-7 (25 %) n'est pas couvert par les backtests ; les stratégies
 à état (S-3, S-4, S-5) sauvegardent leur état pour reprendre après un redémarrage sans vendre par erreur.
+
+
+## 10. Suivi et assistant : alertes, tableau de bord, assistant Groq
+
+**Alertes Telegram (hors machine).** Créer un bot avec @BotFather, puis mettre `TELEGRAM_BOT_TOKEN` et `TELEGRAM_CHAT_ID` dans `.env`.
+`run` envoie alors les alertes WARNING, ERROR et CRITICAL ainsi que le rapport quotidien. Sans ces variables, rien ne part.
+
+**Tableau de bord local** (lecture seule, 127.0.0.1, aucune clé chargée). Mettre `DASHBOARD_PASSWORD` (8 caractères minimum) dans `.env` :
+
+```bash
+./orchestre.sh dashboard --db var/paper.db --stop-file var/STOP --port 8765 --check    # vérifie la configuration
+./orchestre.sh dashboard --db var/paper.db --stop-file var/STOP --port 8765            # démarre
+```
+
+Ouvrir http://127.0.0.1:8765. À distance : tunnel SSH (`ssh -L 8765:127.0.0.1:8765 serveur`), jamais d'exposition publique.
+Pages : vue d'ensemble, agents (pause / reprise), allocation, marché, ordres, risque, expérience, propositions, assistant, journal, aide.
+L'arrêt d'urgence exige de taper `STOP`. Les commandes sont appliquées par l'équipe au tick suivant.
+
+**Assistant Groq** (processus séparé : seul à détenir la clé). Dans `.env` : `GROQ_API_KEY`, `GROQ_MODEL` (à choisir dans ta console Groq) et,
+si besoin, `GROQ_MONTHLY_TOKEN_BUDGET` :
+
+```bash
+./orchestre.sh assistant ask "Pourquoi l'agent trend n'a-t-il pas acheté ?" --db var/paper.db
+./orchestre.sh assistant report --db var/paper.db --telegram
+./orchestre.sh assistant worker --db var/paper.db            # répond aux questions du tableau de bord, rapport quotidien à 07:00 UTC
+./orchestre.sh news --db var/paper.db --rss https://exemple/flux.xml --assets BTC,ETH,SOL
+```
+
+L'assistant est en lecture seule : il ne passe aucun ordre. Son seul outil d'écriture dépose une **proposition en attente** que tu acceptes ou refuses dans
+le tableau de bord. `news` classe des titres d'actualité (sans aucun outil, sortie validée par le code) et peut mettre une paire en pause (plus aucun nouvel achat ;
+les stops et les ventes de réduction restent actifs) ; seul un humain la reprend, depuis la page Marché. Quand le budget de jetons du mois est atteint ou que Groq
+est indisponible, l'assistant s'arrête : l'équipe n'en dépend pas, et le rapport quotidien repasse en version sans LLM.
+
+**Audit de l'existant (phase 0).** `./orchestre.sh audit-legacy --path <dossier> --output docs/audit-existant.md` cherche clés en clair, ordres directs, retraits,
+absence de tests ou de stops, sans jamais recopier un secret. Le rapport actuel (`docs/audit-existant.md`) porte sur un unique script : le code du système
+multi-agents n'est pas sur cette machine.

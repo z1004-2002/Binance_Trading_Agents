@@ -75,6 +75,14 @@ class Store:
         ).fetchone()
         return json.loads(row["state_json"]) if row else None
 
+    def save_state(self, agent_id: str, state: dict, now: datetime) -> None:
+        with self.db.transaction() as c:
+            c.execute(
+                "insert into agent_state (agent_id, state_json, updated_at) values (?, ?, ?) "
+                "on conflict(agent_id) do update set state_json = excluded.state_json, updated_at = excluded.updated_at",
+                (agent_id, _json(state), now.isoformat()),
+            )
+
     def log_event(self, ts: datetime, level: str, kind: str, detail: str) -> None:
         with self.db.transaction() as c:
             c.execute(
@@ -116,8 +124,115 @@ class Store:
                 (ts.isoformat(), value, classification),
             )
 
+    # --- courbes d'équité (EX-DATA-02) ---
+    def log_equity(self, ts: datetime, series: str, equity: float) -> None:
+        with self.db.transaction() as c:
+            c.execute("insert into equity_snapshots (ts, series, equity) values (?, ?, ?)", (ts.isoformat(), series, equity))
+
+    def equity_series(self, series: str) -> list[tuple[str, float]]:
+        rows = self.db.conn.execute(
+            "select ts, equity from equity_snapshots where series = ? order by ts, id", (series,)
+        )
+        return [(r["ts"], r["equity"]) for r in rows]
+
+    # --- journal des ordres ---
+    def log_order(self, ts, agent_id, symbol, side, qty, price, fee, status, client_order_id, note) -> None:
+        with self.db.transaction() as c:
+            c.execute(
+                "insert into order_log (ts, agent_id, symbol, side, qty, price, fee, status, client_order_id, note) "
+                "values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (ts.isoformat(), agent_id, symbol, side, str(qty), str(price), str(fee), status, client_order_id,
+                 mask_secrets(note)),
+            )
+
+    def recent_orders(self, limit: int = 100) -> list[dict]:
+        rows = self.db.conn.execute("select * from order_log order by id desc limit ?", (limit,))
+        return [dict(r) for r in rows]
+
+    # --- commandes du tableau de bord vers le superviseur (EX-ARCH-02) ---
+    def enqueue_command(self, ts: datetime, command: str, target: str | None = None) -> int:
+        with self.db.transaction() as c:
+            cur = c.execute("insert into commands (ts, command, target) values (?, ?, ?)", (ts.isoformat(), command, target))
+            return cur.lastrowid
+
+    def pending_commands(self) -> list[dict]:
+        return [dict(r) for r in self.db.conn.execute("select * from commands where status = 'pending' order by id")]
+
+    def finish_command(self, command_id: int, status: str, result: str, ts: datetime) -> None:
+        with self.db.transaction() as c:
+            c.execute(
+                "update commands set status = ?, result = ?, processed_at = ? where id = ?",
+                (status, mask_secrets(result), ts.isoformat(), command_id),
+            )
+
+    def recent_commands(self, limit: int = 20) -> list[dict]:
+        return [dict(r) for r in self.db.conn.execute("select * from commands order by id desc limit ?", (limit,))]
+
+    # --- propositions de l'assistant, validées par un humain (C-08) ---
+    def add_proposal(self, ts: datetime, kind: str, title: str, payload: dict) -> int:
+        with self.db.transaction() as c:
+            cur = c.execute(
+                "insert into proposals (ts, kind, title, payload_json) values (?, ?, ?, ?)",
+                (ts.isoformat(), kind, mask_secrets(title), mask_secrets(json.dumps(payload, sort_keys=True, default=str))),
+            )
+            return cur.lastrowid
+
+    def list_proposals(self, status: str | None = None) -> list[dict]:
+        query, args = "select * from proposals", ()
+        if status:
+            query, args = query + " where status = ?", (status,)
+        return [dict(r) for r in self.db.conn.execute(query + " order by id desc", args)]
+
+    def decide_proposal(self, proposal_id: int, status: str, ts: datetime) -> bool:
+        """Une proposition n'est décidée qu'une fois."""
+        with self.db.transaction() as c:
+            cur = c.execute(
+                "update proposals set status = ?, decided_at = ? where id = ? and status = 'pending'",
+                (status, ts.isoformat(), proposal_id),
+            )
+            return cur.rowcount == 1
+
+    # --- file de questions pour l'assistant (le tableau de bord n'a pas la clé LLM, EX-UI-08) ---
+    def enqueue_question(self, ts: datetime, question: str) -> int:
+        with self.db.transaction() as c:
+            cur = c.execute("insert into assistant_queue (ts, question) values (?, ?)", (ts.isoformat(), question))
+            return cur.lastrowid
+
+    def next_question(self) -> dict | None:
+        row = self.db.conn.execute("select * from assistant_queue where status = 'pending' order by id limit 1").fetchone()
+        return dict(row) if row else None
+
+    def answer_question(self, question_id: int, answer: str | None, error: str | None, ts: datetime) -> None:
+        with self.db.transaction() as c:
+            c.execute(
+                "update assistant_queue set status = ?, answer = ?, error = ?, answered_at = ? where id = ?",
+                ("error" if error else "done", answer and mask_secrets(answer), error and mask_secrets(error),
+                 ts.isoformat(), question_id),
+            )
+
+    def recent_questions(self, limit: int = 20) -> list[dict]:
+        return [dict(r) for r in self.db.conn.execute("select * from assistant_queue order by id desc limit ?", (limit,))]
+
+    # --- coût de l'assistant (EX-LLM-08, EX-LLM-10) ---
+    def log_llm_call(self, ts, model, purpose, tokens_in, tokens_out, duration_ms, error) -> None:
+        with self.db.transaction() as c:
+            c.execute(
+                "insert into llm_calls (ts, model, purpose, tokens_in, tokens_out, duration_ms, error) values (?, ?, ?, ?, ?, ?, ?)",
+                (ts.isoformat(), model, purpose, tokens_in, tokens_out, duration_ms, error and mask_secrets(error)),
+            )
+
+    def llm_tokens_for_month(self, now: datetime) -> int:
+        month = f"{now.year:04d}-{now.month:02d}"
+        row = self.db.conn.execute(
+            "select coalesce(sum(tokens_in + tokens_out), 0) from llm_calls where substr(ts, 1, 7) = ?", (month,)
+        ).fetchone()
+        return int(row[0])
+
     def count(self, table: str) -> int:
-        allowed = {"messages", "events", "agent_state", "ledger", "tracked_orders", "regimes", "volatility", "sentiment"}
+        allowed = {
+            "messages", "events", "agent_state", "ledger", "tracked_orders", "regimes", "volatility", "sentiment",
+            "equity_snapshots", "order_log", "commands", "proposals", "assistant_queue", "llm_calls",
+        }
         if table not in allowed:
             raise ValueError("table inconnue")
         return self.db.conn.execute(f"select count(*) from {table}").fetchone()[0]
