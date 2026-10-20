@@ -247,3 +247,20 @@ Une promotion avance d'une étape à la fois ; entrer en LIVE_PILOTE ou LIVE exi
 
 **Sauvegarde** de la base (copie cohérente même pendant que le système tourne) : `./orchestre.sh backup --db var/paper.db --dest backups --keep 14`. Copie-la hors de la machine.
 Les modèles de services système et de sauvegarde automatique sont dans `deploy/` (non testés sur un vrai serveur).
+
+
+## 12. Piloter les agents depuis le tableau de bord, jumeau numérique
+
+Le tableau de bord (thème clair, barre latérale) a une page **Agents** : le catalogue complet (analyse, stratèges S-1 à S-14, décision collective, assistant) avec l'état de chacun
+(En marche, En pause, Désactivé, Inactif, Simulation seule, Non implémenté + la raison). S-10 à S-14 (futures, marge, Earn, pairs trading) figurent au catalogue mais ne sont **pas construits**.
+
+Depuis l'interface on peut : mettre en pause ou reprendre un agent, le **désactiver** (ses positions et ordres sont soldés d'abord, puis il disparaît et ne revient pas au redémarrage),
+l'**activer** avec un formulaire validé champ par champ (paire, budget...), et **changer le budget** d'un agent à exposition cible. L'allocateur, le RiskAgent et les plafonds restent juges :
+un budget au-delà du capital investissable est refusé. En réel, un agent activé depuis l'interface est refusé tant que sa promotion n'est pas écrite dans la configuration ;
+l'agent hérité (S-8) ne s'active que par la configuration, et le changement d'étape du cycle de vie reste en ligne de commande.
+
+**Jumeau numérique** : `./orchestre.sh up --mode testnet --twin` lance en plus une réplique **paper** de la même configuration (base `*-twin.db`, fichier d'arrêt `STOP-twin`), alimentée par les mêmes prix réels.
+Les commandes de pilotage lui sont recopiées. La page **Jumeaux numériques** compare, pour l'équipe et pour chaque agent, la valeur réelle et celle du jumeau, le nombre d'ordres et les frais.
+Un écart durable au-dessus de 3 % se comprend avant toute promotion en réel. En mode paper, un jumeau est presque identique à l'original : son intérêt est surtout avec le testnet.
+
+Les stratèges S-9a (arbitrage triangulaire, observateur sans ordre), S-9b (tenue de marché, simulation seulement) et S-8 (adaptateur) se règlent dans `config/strategies.example.toml`.

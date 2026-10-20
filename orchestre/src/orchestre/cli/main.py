@@ -271,7 +271,7 @@ def _cmd_dashboard(args, environ, out, err) -> int:
     if not Path(args.db).exists():
         raise ConfigError(f"base introuvable : {args.db} (lancer d'abord `run` ou `run --paper`)")
     try:
-        server = DashboardServer(args.db, args.stop_file, password, port=args.port)
+        server = DashboardServer(args.db, args.stop_file, password, port=args.port, twin_db=args.twin_db)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
     url = f"http://127.0.0.1:{server.port}"
@@ -518,6 +518,7 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--interval", type=float, default=30.0)
     up.add_argument("--env-file", default=".env")
     up.add_argument("--paper-cash", type=float, default=None)
+    up.add_argument("--twin", action="store_true", help="lance aussi un jumeau numérique : réplique papier de la même configuration")
     up.add_argument("--no-dashboard", action="store_true")
     up.add_argument("--no-assistant", action="store_true")
     up.add_argument("--no-analysis", action="store_true")
@@ -554,6 +555,7 @@ def build_parser() -> argparse.ArgumentParser:
     ds = sub.add_parser("dashboard")
     ds.add_argument("--db", default="var/orchestre.db")
     ds.add_argument("--stop-file", default="var/STOP")
+    ds.add_argument("--twin-db", default=None, help="base du jumeau numérique (réplique papier), lue en lecture seule")
     ds.add_argument("--port", type=int, default=8765)
     ds.add_argument("--env-file", default=".env")
     ds.add_argument("--check", action="store_true", help="vérifie la configuration et s'arrête")

@@ -180,11 +180,13 @@ def test_untrusted_text_from_the_database_is_escaped(env):
     assert "<script>alert(1)</script>" not in page and "&lt;script&gt;" in page
 
 
-def test_agents_page_lists_states_positions_and_last_orders(env):
+def test_agents_catalog_lists_states_and_the_agent_page_shows_position_and_last_orders(env):
     server, *_ = env
-    page = logged(server).request("GET", "/agents")[2]
-    assert "dca" in page and "trend" in page and "RUNNING" in page and "PAUSED" in page
-    assert "0.001" in page and "BUY" in page
+    c = logged(server)
+    page = c.request("GET", "/agents")[2]
+    assert "S-1" in page and "S-3" in page and "En marche" in page and "En pause" in page
+    assert "0.001" in c.request("GET", "/agent/trend")[2]                          # position de S-3
+    assert "BUY" in c.request("GET", "/agent/dca")[2] and "ordre envoyé" in c.request("GET", "/agent/dca")[2]
 
 
 def test_allocation_page_shows_budgets_and_regime_multipliers(env):

@@ -30,6 +30,12 @@ class PaperExchange(FakeExchange):
         )
         self._market, self._slippage = market, slippage
 
+    def ensure_symbol(self, symbol: str) -> None:
+        """Ajoute une paire à chaud (agent activé depuis l'interface) : filtres et prix lus sur le marché réel."""
+        if symbol not in self._filters:
+            self._filters[symbol] = self._market.get_filters(symbol)
+            self._prices[symbol] = self._market.get_price(symbol)
+
     def get_price(self, symbol: str) -> Decimal:
         price = self._market.get_price(symbol)
         self.set_price(symbol, price)  # déclenche les ordres en attente et les stops

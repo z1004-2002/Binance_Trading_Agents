@@ -27,6 +27,11 @@ class Supervisor:
         if critical:
             self._critical.add(agent.agent_id)
 
+    def unregister(self, agent_id: str) -> None:
+        self._agents.pop(agent_id, None)
+        self._last_beat.pop(agent_id, None)
+        self._critical.discard(agent_id)
+
     def heartbeat(self, agent_id: str) -> None:
         self._last_beat[agent_id] = self._clock.now()
 

@@ -261,6 +261,7 @@ def read_env_names(path: str | Path) -> dict[str, int]:
 
 def port_is_free(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)   # comme le serveur : un port en TIME_WAIT après un arrêt récent est libre
         try:
             s.bind(("127.0.0.1", port))
         except OSError:
@@ -301,6 +302,21 @@ def plan_components(args, present: Mapping[str, int], port_free: Callable[[int],
     if args.ticks is not None:
         engine += ["--ticks", str(args.ticks)]
     components = [Component("moteur", engine)]
+    twin_db = None
+    if getattr(args, "twin", False):
+        # jumeau numérique : même configuration, en paper, sur sa propre base et son propre fichier d'arrêt
+        twin_db = str(Path(db).with_name(Path(db).stem + "-twin.db"))
+        twin = [*cli, "run", "--config", args.config, "--db", twin_db, "--stop-file", args.stop_file + "-twin",
+                "--interval", str(args.interval), "--env-file", args.env_file, "--paper"]
+        if args.paper_cash is not None:
+            twin += ["--paper-cash", str(args.paper_cash)]
+        if args.no_analysis:
+            twin.append("--no-analysis")
+        if args.ticks is not None:
+            twin += ["--ticks", str(args.ticks)]
+        components.append(Component("jumeau", twin))
+        if paper:
+            warnings.append("le jumeau d'un système déjà en paper est une copie presque identique : il est surtout utile avec --mode testnet")
 
     if not args.no_dashboard:
         if present.get("DASHBOARD_PASSWORD", 0) < 8:
@@ -308,9 +324,11 @@ def plan_components(args, present: Mapping[str, int], port_free: Callable[[int],
         elif not port_free(args.port):
             warnings.append(f"tableau de bord non démarré : le port {args.port} est occupé (essayer --port)")
         else:
+            dashboard = [*cli, "dashboard", "--db", db, "--stop-file", args.stop_file, "--port", str(args.port), "--env-file", args.env_file]
+            if twin_db:
+                dashboard += ["--twin-db", twin_db]
             components.append(Component(
-                "tableau de bord", [*cli, "dashboard", "--db", db, "--stop-file", args.stop_file, "--port", str(args.port),
-                                    "--env-file", args.env_file],
+                "tableau de bord", dashboard,
                 env=minimal_env(), url=f"http://127.0.0.1:{args.port}", wait_for=Path(db)))
     if not args.no_assistant:
         if "GROQ_API_KEY" not in present or "GROQ_MODEL" not in present:
@@ -353,7 +371,7 @@ def cmd_up(args, out, err, spawn: Callable = subprocess.Popen) -> int:
                 "--stop-file", args.stop_file, "--port", str(args.port), "--interval", str(args.interval),
                 "--env-file", args.env_file]
         argv += [f for f, on in (("--no-dashboard", args.no_dashboard), ("--no-assistant", args.no_assistant),
-                                 ("--no-analysis", args.no_analysis)) if on]
+                                 ("--no-analysis", args.no_analysis), ("--twin", getattr(args, "twin", False))) if on]
         if args.paper_cash is not None:
             argv += ["--paper-cash", str(args.paper_cash)]
         with open(base / "logs" / "up.log", "ab") as log:

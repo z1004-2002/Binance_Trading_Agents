@@ -6,11 +6,13 @@ import html
 from datetime import datetime
 
 from orchestre.analysis.sentiment import ATTRIBUTION
+from orchestre.dashboard.catalog import BY_ID, GROUPS, CATALOG, Entry
 
 NAV = [
-    ("/", "Vue d'ensemble"), ("/agents", "Agents"), ("/allocation", "Allocation"), ("/market", "Marché"),
-    ("/orders", "Ordres"), ("/risk", "Risque"), ("/experiment", "Expérience"), ("/proposals", "Propositions"),
-    ("/assistant", "Assistant"), ("/journal", "Journal"), ("/help", "Aide"),
+    ("Pilotage", [("/", "◧", "Vue d'ensemble"), ("/agents", "◉", "Agents"), ("/twins", "⧉", "Jumeaux numériques")]),
+    ("Marché et capital", [("/market", "↗", "Marché"), ("/allocation", "◔", "Allocation"), ("/orders", "☰", "Ordres")]),
+    ("Contrôle", [("/risk", "⛨", "Risque"), ("/experiment", "⚗", "Expérience"), ("/proposals", "✎", "Propositions"),
+                  ("/assistant", "✦", "Assistant"), ("/journal", "≡", "Journal"), ("/help", "?", "Aide")]),
 ]
 TIERS = {
     0: ("ok", "Normal"), 1: ("warn", "Palier 1 (≥ 5 %) : budgets réduits"),
@@ -62,17 +64,22 @@ def layout(title: str, body: str, active: str, info: dict, csrf: str, msg: str =
     tier_kind, tier_text = TIERS.get(info.get("tier", 0), TIERS[0])
     hb_kind, hb_text = heartbeat(info)
     kill = "ARRÊT D'URGENCE ACTIF" if info.get("kill") else "Kill switch inactif"
-    nav = "".join(f'<a href="{href}"{" class=active" if href == active else ""}>{esc(label)}</a>' for href, label in NAV)
+    nav = "".join(
+        f"<h3>{esc(group)}</h3>" + "".join(
+            f'<a href="{href}"{" class=active" if href == active or (href == "/agents" and active.startswith("/agent/")) else ""}>'
+            f'<span class="ico">{ico}</span>{esc(label)}</a>' for href, ico, label in items)
+        for group, items in NAV
+    )
     flash = f'<div class="msg" role="status">{esc(msg[:200])}</div>' if msg else ""
     return f"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{esc(title)} · ORCHESTRE</title><link rel="stylesheet" href="/static/app.css"></head>
-<body{' data-autorefresh="1"' if autorefresh else ''}><header>
-<div class="banner {cls}"><span>{esc(text)}</span><span class="chips">
-<span class="chip" id="hb">Dernier tick : {esc(hb_text)}</span><span class="chip">{esc(tier_text)}</span><span class="chip">{esc(kill)}</span></span></div>
-<nav aria-label="Navigation">{nav}</nav></header>
-<main><h1>{esc(title)}</h1>{flash}{body}
-<form class="inline mt" method="post" action="/logout"><input type="hidden" name="csrf" value="{esc(csrf)}">
-<button>Se déconnecter</button></form></main><script src="/static/app.js"></script></body></html>"""
+<body{' data-autorefresh="1"' if autorefresh else ''}><div class="app"><aside class="sidebar" aria-label="Navigation">
+<div class="brand">ORCHESTRE<small>équipe d'agents de trading</small></div><nav>{nav}</nav>
+<form class="inline" method="post" action="/logout"><input type="hidden" name="csrf" value="{esc(csrf)}"><p><button>Se déconnecter</button></p></form></aside>
+<div class="main"><header class="top"><button class="menu" id="menu" aria-label="Menu">☰</button><span class="env {cls}">{esc(text)}</span><span class="chips">
+<span class="chip {hb_kind if hb_kind != 'muted' else ''}" id="hb">Dernier tick : {esc(hb_text)}</span><span class="chip {tier_kind if tier_kind != 'ok' else ''}">{esc(tier_text)}</span>
+<span class="chip {'crit' if info.get('kill') else ''}">{esc(kill)}</span></span></header>
+<main><h1>{esc(title)}</h1>{flash}{body}</main></div></div><script src="/static/app.js"></script></body></html>"""
 
 
 def login_page(error: str = "") -> str:
@@ -113,8 +120,8 @@ def line_chart(series: dict[str, list[tuple[str, float]]], width: int = 720, hei
     lines, legend = [], []
     for i, (name, pts) in enumerate(points.items()):
         coords = " ".join(f"{sx(epoch(ts)):.1f},{sy(v):.1f}" for ts, v in pts)
-        lines.append(f'<polyline class="l{min(i, 1)}" points="{coords}"/>')
-        legend.append(f'<span>{"━" if i == 0 else "┅"} {esc(name)} : {money(pts[-1][1])}</span>')
+        lines.append(f'<polyline class="l{min(i, 3)}" points="{coords}"/>')
+        legend.append(f'<span>{"━" if i in (0, 2) else "┅"} {esc(name)} : {money(pts[-1][1])}</span>')
     first = esc(min(ts for p in points.values() for ts, _ in p)[:10])
     last = esc(max(ts for p in points.values() for ts, _ in p)[:10])
     return (
@@ -126,11 +133,12 @@ def line_chart(series: dict[str, list[tuple[str, float]]], width: int = 720, hei
     )
 
 
-def command_form(csrf: str, command: str, target: str, label: str, css: str = "") -> str:
+def command_form(csrf: str, command: str, target: str, label: str, css: str = "", back: str = "", confirm: str = "") -> str:
+    ask = f' data-confirm="{esc(confirm)}"' if confirm else ""
     return (
-        f'<form class="inline" method="post" action="/command"><input type="hidden" name="csrf" value="{esc(csrf)}">'
+        f'<form class="inline" method="post" action="/command"{ask}><input type="hidden" name="csrf" value="{esc(csrf)}">'
         f'<input type="hidden" name="command" value="{esc(command)}"><input type="hidden" name="target" value="{esc(target)}">'
-        f'<button class="{css}">{esc(label)}</button></form>'
+        f'<input type="hidden" name="back" value="{esc(back)}"><button class="{css}">{esc(label)}</button></form>'
     )
 
 
@@ -163,22 +171,160 @@ def overview(data, csrf: str) -> str:
     return f'<div class="grid">{cards}</div><h2>Valeur dans le temps</h2>{chart}<h2>Alertes récentes</h2>{alerts}'
 
 
+def _controls(row: dict, csrf: str, back: str) -> str:
+    entry, state = row["entry"], row["status"]
+    if not entry.implemented or not entry.controllable:
+        return ""
+    if not row["active"]:
+        return ""
+    pause = command_form(csrf, "pause", entry.id, "Pause", back=back) if state.startswith("En marche") else command_form(csrf, "resume", entry.id, "Reprise", back=back)
+    return pause + " " + command_form(csrf, "disable", entry.id, "Désactiver", "soft-danger", back,
+                                      f"Désactiver {entry.name} ? Ses positions et ordres seront d'abord soldés.")
+
+
+def _agent_card(row: dict, csrf: str) -> str:
+    entry = row["entry"]
+    back = "/agents"
+    meta = []
+    if row["allocated"] is not None:
+        meta.append(f'<span>alloué {money(row["allocated"])}</span>')
+    if row["value"] is not None:
+        meta.append(f'<span>valeur {money(row["value"])}</span>')
+    body = esc(entry.summary) if entry.implemented else f'<i>{esc(entry.reason)}</i>'
+    if entry.paper_only:
+        body += " <b>Simulation uniquement.</b>"
+    link = f'<a class="btn" href="/agent/{esc(entry.id)}">'
+    if entry.controllable and not row["active"]:
+        link += "Configurer et activer</a>"
+    elif entry.implemented:
+        link += "Détails</a>"
+    else:
+        link += "Pourquoi ?</a>"
+    off = "" if entry.implemented and (row["active"] or not entry.controllable) else " off"
+    return (f'<div class="card agent-card{off}"><div><h3>{esc(entry.name)}</h3><span class="code">{esc(entry.code)}</span> '
+            f'{badge(row["kind"], row["status"])}</div><p>{body}</p><div class="meta">{"".join(meta)}</div>'
+            f'<div class="actions">{_controls(row, csrf, back)} {link}</div></div>')
+
+
 def agents(data, csrf: str) -> str:
+    rows = data.catalog()
+    sections = []
+    for group in GROUPS:
+        cards = "".join(_agent_card(r, csrf) for r in rows if r["entry"].group == group)
+        sections.append(f'<h2>{esc(group)}</h2><div class="grid wide">{cards}</div>')
+    all_actions = command_form(csrf, "pause", "all", "Tout mettre en pause", back="/agents") + " " + command_form(csrf, "resume", "all", "Tout reprendre", back="/agents")
+    commands = table(["Heure", "Commande", "Cible", "Statut", "Résultat"],
+                     [[esc(c["ts"][:19]), esc(c["command"]), esc(c["target"] or "")[:60], esc(c["status"]), esc(c["result"] or "")] for c in data.commands()])
+    return ('<p class="sub-title">Active, mets en pause ou désactive les agents d\'ici. Chaque action passe par le superviseur et le RiskAgent : '
+            "aucune saisie d'ordre manuelle, et les stops de protection restent chez Binance.</p>"
+            + "".join(sections) + f"<p>{all_actions}</p>" + kill_zone(csrf) + "<h2>Commandes récentes</h2>" + commands)
+
+
+def _enable_form(entry: Entry, csrf: str) -> str:
+    inputs = "".join(
+        f'<div><label for="f-{f.name}">{esc(f.label)}{" (facultatif)" if f.optional else ""}</label>'
+        f'<input id="f-{f.name}" type="text" name="{esc(f.name)}" value="{esc(f.default)}" autocomplete="off"></div>' for f in entry.fields)
+    note = "<p class=\"small muted\">En réel, un agent activé ici est refusé tant que sa promotion n'est pas écrite dans la configuration.</p>"
+    return (f'<form method="post" action="/command"><input type="hidden" name="csrf" value="{esc(csrf)}"><input type="hidden" name="command" value="enable">'
+            f'<input type="hidden" name="target" value="{esc(entry.id)}"><input type="hidden" name="back" value="/agent/{esc(entry.id)}">'
+            f'<div class="form-grid">{inputs}</div><p><button class="primary">Activer {esc(entry.code)}</button></p></form>' + note)
+
+
+def agent_page(data, csrf: str, agent_id: str) -> str:
+    entry = BY_ID[agent_id]
+    info = data.info()
+    row = next(r for r in data.catalog() if r["entry"].id == agent_id)
+    back = f"/agent/{agent_id}"
+    kind = (info.get("kinds") or {}).get(agent_id)
+    head = f'<p>{badge(row["kind"], row["status"])} <span class="muted">{esc(entry.code)} · {esc(entry.group)}</span></p><p>{esc(entry.summary)}</p>'
+    if not entry.implemented:
+        return head + f'<div class="card"><b>Non implémenté.</b><p>{esc(entry.reason)}</p></div>'
+    if entry.id == "legacy" and not row["active"]:
+        return head + f'<div class="card"><b>Configuration uniquement.</b><p>{esc(entry.reason)}</p></div>'
+    parts = [head]
+    if entry.controllable:
+        if row["active"]:
+            controls = _controls(row, csrf, back)
+            if kind in ("exposure", "portfolio", "marketmaker", "legacy"):
+                controls += (f' <form class="inline" method="post" action="/command"><input type="hidden" name="csrf" value="{esc(csrf)}">'
+                             f'<input type="hidden" name="command" value="set_budget"><input type="hidden" name="target" value="{esc(agent_id)}">'
+                             f'<input type="hidden" name="back" value="{esc(back)}"><input type="text" name="amount" class="narrow" placeholder="nouveau budget" autocomplete="off">'
+                             '<button>Changer le budget</button></form>')
+            parts.append(f"<h2>Contrôle</h2><p>{controls}</p>")
+        else:
+            parts.append("<h2>Activer cet agent</h2>" + _enable_form(entry, csrf))
+            if entry.paper_only:
+                parts.append('<p class="small muted">Refusé par le moteur hors du mode paper : la tenue de marché ne passe jamais d\'ordres réels.</p>')
+    cards = [
+        card("Alloué", money(row["allocated"]) if row["allocated"] is not None else "—", "budget confié par l'allocateur"),
+        card("Engagé", money(row["committed"]) if row["committed"] is not None else "—", "capital réservé par ses ordres et positions"),
+        card("Valeur propre", money(row["value"]) if row["value"] is not None else "—", "budget + flux de ses exécutions + positions"),
+    ]
+    if entry.controllable:
+        parts.append(f'<h2>Chiffres</h2><div class="grid">{"".join(cards)}</div>')
+        series = {"agent (réel)": data.series(f"agent:{agent_id}")}
+        if data.active_twin() is not None:
+            series["jumeau"] = data.active_twin().series(f"agent:{agent_id}")
+        parts.append("<h2>Valeur dans le temps</h2>" + line_chart(series))
+        stage = data.stage(entry.code) if entry.code in ("S-1", "S-2", "S-3", "S-4", "S-5", "S-6", "S-7") else None
+        if stage:
+            events = [[esc(e["ts"][:16]), esc(e["from_stage"]), esc(e["to_stage"]), esc(e["decided_by"]), esc(e["reason"])] for e in data.lifecycle(entry.code)]
+            parts.append(f"<h2>Cycle de vie</h2><p>Étape actuelle : {badge('ok' if stage in ('LIVE', 'LIVE_PILOTE') else 'muted', stage)}</p>"
+                         + table(["Date", "De", "Vers", "Par", "Raison"], events)
+                         + f'<p class="small muted">Changer d\'étape reste une décision écrite : <code>./orchestre.sh lifecycle set {esc(entry.code)} &lt;étape&gt; --reason "…"</code>.</p>')
+        orders_rows = [[esc(o["ts"][:19]), esc(o["symbol"]), esc(o["side"]), esc(o["qty"]), esc(o["price"]), esc(o["fee"]), esc(o["status"]), esc(o["note"])]
+                       for o in data.agent_orders(agent_id)]
+        parts.append("<h2>Derniers ordres</h2>" + table(["Heure", "Paire", "Sens", "Qté", "Prix", "Frais", "Statut", "Note"], orders_rows, {3, 4, 5}))
+        summary = data._summary(agent_id)
+        parts.append(f'<h2>Position</h2><p>{esc(summary)}</p>')
+    else:
+        events = [[esc(e["ts"][:19]), esc(e["level"]), esc(e["detail"])] for e in data.events(limit=500) if agent_id in (e.get("detail") or "").lower()][:20]
+        parts.append("<h2>Événements récents</h2>" + table(["Heure", "Niveau", "Détail"], events))
+    card_name = entry.card
+    parts.append(f'<p class="small muted">Carte pédagogique : <code>docs/agents/{esc(card_name)}</code>.</p>' if card_name else "")
+    return "".join(parts)
+
+
+def _gap(live: float | None, twin: float | None) -> tuple[str, str]:
+    if live is None or twin is None or not live:
+        return "muted", "—"
+    gap = (live - twin) / abs(live)
+    kind = "ok" if abs(gap) < 0.01 else "warn" if abs(gap) < 0.03 else "crit"
+    return kind, f"{gap:+.2%}"
+
+
+def twins(data, csrf: str) -> str:
+    twin = data.active_twin()
+    intro = ("<p class=\"sub-title\">Le jumeau numérique est une réplique papier de la même configuration, alimentée par les mêmes prix réels, "
+             "avec sa propre base de données. L'écart avec le système réel mesure ce que coûtent les frais, le glissement et les ordres refusés.</p>")
+    if twin is None:
+        return intro + ('<div class="card"><b>Aucun jumeau branché.</b><p>Lance le système avec <code>./orchestre.sh up --mode testnet --twin</code> '
+                        "(ou donne <code>--twin-db</code> au tableau de bord). Le jumeau tourne en paper dans un second processus ; "
+                        "ses ordres n'atteignent jamais Binance.</p></div>")
+    info, tinfo = data.info(), twin.info()
+    live_team, twin_team = data.series("TEAM"), twin.series("TEAM")
+    kind, gap = _gap(info.get("equity"), tinfo.get("equity"))
+    age = tinfo.get("tick_age")
+    cards = "".join([
+        card("Équipe réelle", money(info.get("equity", 0)), esc(banner(info)[1])),
+        card("Équipe jumelle", money(tinfo.get("equity", 0)), "silencieux" if age is None or age > 600 else f"dernier tick il y a {age} s"),
+        card("Écart", f'<span class="twin-gap {kind}">{esc(gap)}</span>', "réel moins jumeau, rapporté au réel"),
+    ])
+    live_stats, twin_stats = data.order_stats(), twin.order_stats()
+    ids = sorted(set(data.agent_ids()) | set(twin.agent_ids()))
     rows = []
-    for a in data.agents():
-        kind = {"RUNNING": "ok", "PAUSED": "warn", "DEGRADED": "crit", "STOPPED": "crit"}.get(a["state"], "muted")
-        last = a["last_order"]
-        last_text = f'{esc(last["side"])} {esc(last["qty"])} {esc(last["symbol"])} ({esc(last["status"])}) : {esc(last["note"])}' if last else "—"
-        actions = command_form(csrf, "pause", a["agent_id"], "Pause") + " " + command_form(csrf, "resume", a["agent_id"], "Reprise")
-        rows.append([f'<b>{esc(a["agent_id"])}</b> <span class="muted">{esc(a["code"])}</span>', badge(kind, a["state"]),
-                     money(a["allocated"]), money(a["committed"]), esc(a["summary"]), last_text, actions])
-    all_actions = command_form(csrf, "pause", "all", "Tout mettre en pause") + " " + command_form(csrf, "resume", "all", "Tout reprendre")
-    return (
-        table(["Agent", "État", "Alloué", "Engagé", "Position", "Dernière décision", "Actions"], rows, {2, 3})
-        + f"<p>{all_actions}</p>" + kill_zone(csrf)
-        + "<h2>Commandes récentes</h2>"
-        + table(["Heure", "Commande", "Cible", "Statut", "Résultat"], [[esc(c["ts"][:19]), esc(c["command"]), esc(c["target"] or ""), esc(c["status"]), esc(c["result"] or "")] for c in data.commands()])
-    )
+    for a in ids:
+        lv, tv = data.last_value(a), twin.last_value(a)
+        k, g = _gap(lv, tv)
+        ls, ts = live_stats.get(a, {"orders": 0, "fees": 0.0}), twin_stats.get(a, {"orders": 0, "fees": 0.0})
+        rows.append([f'<a href="/agent/{esc(a)}">{esc(a)}</a>', money(lv) if lv is not None else "—", money(tv) if tv is not None else "—",
+                     f'<span class="twin-gap {k}">{esc(g)}</span>', f'{ls["orders"]} / {ts["orders"]}', f'{ls["fees"]:.2f} / {ts["fees"]:.2f}'])
+    return (intro + f'<div class="grid">{cards}</div><h2>Équipe : réel et jumeau</h2>'
+            + line_chart({"réel": live_team, "jumeau": twin_team})
+            + "<h2>Agent par agent</h2>"
+            + table(["Agent", "Valeur réelle", "Valeur jumelle", "Écart", "Ordres (réel / jumeau)", "Frais (réel / jumeau)"], rows, {1, 2, 3, 4, 5})
+            + '<p class="small muted">Un écart durable au-dessus de 3 % mérite une explication (ordres refusés, glissement, données manquantes) '
+              "avant toute promotion en réel (EX-LC-03).</p>")
 
 
 def allocation(data, csrf: str) -> str:

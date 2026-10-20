@@ -66,6 +66,10 @@ class RuntimeState:
     orders_today: int = 0
     ref_price0: Decimal | None = None
     ref_equity0: Decimal | None = None
+    flows: dict = field(default_factory=dict)        # agent -> {"start", "cash", "qty": {symbole: quantité}} : valeur propre à chaque agent
+    disabled: list = field(default_factory=list)     # agents désactivés par un humain (survit au redémarrage)
+    dynamic: dict = field(default_factory=dict)      # agents activés depuis l'interface : nom -> paramètres
+    budgets: dict = field(default_factory=dict)      # budgets modifiés depuis l'interface
 
     def to_dict(self) -> dict:
         def s(v):
@@ -76,6 +80,9 @@ class RuntimeState:
             "tier1_applied": self.tier1_applied, "day": self.day,
             "day_start_equity": s(self.day_start_equity), "orders_today": self.orders_today,
             "ref_price0": s(self.ref_price0), "ref_equity0": s(self.ref_equity0),
+            "flows": {a: {"start": str(f["start"]), "cash": str(f["cash"]), "qty": {k: str(v) for k, v in f["qty"].items()}}
+                      for a, f in self.flows.items()},
+            "disabled": list(self.disabled), "dynamic": dict(self.dynamic), "budgets": {a: str(v) for a, v in self.budgets.items()},
         }
 
     @classmethod
@@ -83,8 +90,11 @@ class RuntimeState:
         def dec(v):
             return None if v is None else Decimal(v)
 
+        flows = {a: {"start": Decimal(f["start"]), "cash": Decimal(f["cash"]), "qty": {k: Decimal(v) for k, v in f["qty"].items()}}
+                 for a, f in d.get("flows", {}).items()}
         return cls(dec(d["baseline_value"]), dec(d["peak_equity"]), d["tier1_applied"], d["day"],
-                   dec(d["day_start_equity"]), d["orders_today"], dec(d.get("ref_price0")), dec(d.get("ref_equity0")))
+                   dec(d["day_start_equity"]), d["orders_today"], dec(d.get("ref_price0")), dec(d.get("ref_equity0")),
+                   flows, list(d.get("disabled", [])), dict(d.get("dynamic", {})), {a: Decimal(v) for a, v in d.get("budgets", {}).items()})
 
 
 class _SimpleAgent(Agent):
@@ -109,6 +119,7 @@ class _Unit:
         self.started = False
         self.errors = 0
         self.fear_greed: int | None = None
+        self.disabling = False        # désactivation demandée : sort de ses positions puis disparaît
 
     @property
     def grid_cfg(self) -> GridConfig | None:
@@ -204,7 +215,9 @@ class Orchestrator:
         self._report_due: tuple[str, int] | None = None
         self._logged_rejections: dict[str, int] = {}
         self._last_tick: datetime | None = None
-        self.svc.listener = self._log_order
+        self.specs: dict[str, dict] = {}              # configuration de chaque stratégie connue (pour la réactiver sans paramètres)
+        self._counted: dict[str, Decimal] = {}        # quantité déjà comptée par ordre, pour ne jamais compter deux fois
+        self.svc.listener = self._on_order
 
     # --- composition de l'équipe ---
     def _reserve_budget(self, agent_id: str, budget: Decimal) -> None:
@@ -221,6 +234,7 @@ class Orchestrator:
         agent.start()
         self.supervisor.register(agent)
         self.units[unit.agent_id], self.unit_agents[unit.agent_id] = unit, agent
+        self.state.flows.setdefault(unit.agent_id, {"start": unit.budget, "cash": Decimal("0"), "qty": {}})
 
     def add_grid(self, cfg: GridConfig, exit_policy: str = "pause", max_price_deviation_pct: Decimal = Decimal("0.25")) -> None:
         if any(u.kind == "grid" and u.symbol == cfg.symbol for u in self.units.values()):
@@ -339,6 +353,28 @@ class Orchestrator:
             self._filters[symbol] = self.exchange.get_filters(symbol)
         return self._filters[symbol]
 
+    def _on_order(self, agent_id: str, result, note: str) -> None:
+        self._log_order(agent_id, result, note)
+        self._count_fill(agent_id, result)
+
+    def _count_fill(self, agent_id: str, result) -> None:
+        """Flux de trésorerie et quantités de chaque agent, tirés de ses exécutions : base de sa courbe de valeur."""
+        delta = result.filled_qty - self._counted.get(result.client_order_id, Decimal("0"))
+        if delta <= 0 or agent_id not in self.state.flows:
+            return
+        self._counted[result.client_order_id] = result.filled_qty
+        flow, sign = self.state.flows[agent_id], 1 if result.side.value == "BUY" else -1
+        fee = result.fee_quote * delta / result.filled_qty          # frais au prorata de la part nouvellement exécutée
+        flow["cash"] += -sign * delta * result.avg_price - fee
+        flow["qty"][result.symbol] = flow["qty"].get(result.symbol, Decimal("0")) + sign * delta
+
+    def agent_value(self, agent_id: str) -> Decimal | None:
+        flow = self.state.flows.get(agent_id)
+        if flow is None:
+            return None
+        held = sum((q * self._prices.get(sym, Decimal("0")) for sym, q in flow["qty"].items()), Decimal("0"))
+        return flow["start"] + flow["cash"] + held
+
     def _log_order(self, agent_id: str, result, note: str) -> None:
         self.store.log_order(
             self.clock.now(), agent_id, result.symbol, result.side.value, result.filled_qty or result.orig_qty,
@@ -348,13 +384,26 @@ class Orchestrator:
     # --- reprise ---
     def restore(self) -> None:
         self.svc.import_tracked(self.store.load_tracked())
+        saved = self.store.load_state("orchestrator")
+        if saved is not None:
+            self.state = RuntimeState.from_dict(saved)
+        for name, params in dict(self.state.dynamic).items():       # agents activés depuis l'interface lors d'une exécution précédente
+            if name in self.units:
+                continue
+            try:
+                self._enable(name, params)
+            except Exception as exc:
+                self.alerts.send("ERROR", f"agent {name} activé depuis l'interface non rétabli : {exc}")
+        for agent_id in list(self.state.disabled):                  # les agents désactivés le restent, même si le fichier les liste
+            self._remove_unit(agent_id)
+        for agent_id, amount in self.state.budgets.items():
+            if agent_id in self.units:
+                self.units[agent_id].budget = amount
         for agent_id, unit in self.units.items():
             saved = self.store.load_state(agent_id)
             if saved is not None:
                 unit.import_state(saved)
-        saved = self.store.load_state("orchestrator")
-        if saved is not None:
-            self.state = RuntimeState.from_dict(saved)
+            self.state.flows.setdefault(agent_id, {"start": unit.budget, "cash": Decimal("0"), "qty": {}})
         sentiment = self.store.load_state("sentiment_state")
         if sentiment is not None:
             self.sentiment_state.reasons = dict(sentiment["reasons"])
@@ -423,6 +472,7 @@ class Orchestrator:
             self._pause_all(f"adresse IP bannie (418) : {exc}")
             return "PAUSED"
 
+        self._finish_disabling()
         self.supervisor.heartbeat("execution")
         if self._reconcile_due(now):
             gaps = [g for s in symbols for g in self.svc.reconcile(s)]
@@ -623,6 +673,8 @@ class Orchestrator:
                 self.store.log_equity(now, f"agent:{agent_id}", float(unit.runner.equity(self._prices[unit.symbol])))
             elif unit.kind == "portfolio":
                 self.store.log_equity(now, f"agent:{agent_id}", float(unit.runner.equity(self._prices)))
+            elif unit.kind in ("grid", "dca"):
+                self.store.log_equity(now, f"agent:{agent_id}", float(self.agent_value(agent_id)))
             elif unit.kind == "marketmaker":
                 self.store.log_equity(now, f"agent:{agent_id}", float(unit.runner.equity(self._prices[unit.symbol])))
             elif unit.kind == "legacy":
@@ -665,6 +717,12 @@ class Orchestrator:
                     return "done", f"{pair} en pause (aucun nouvel achat) : {reason or 'actualité grave'}"
                 self.sentiment_state.resume_pair(pair)
                 return "done", f"{pair} reprise"
+            if command == "enable":
+                return self._command_enable(target)
+            if command == "disable":
+                return self._command_disable(target)
+            if command == "set_budget":
+                return self._command_set_budget(target)
             if command not in ("pause", "resume"):
                 return "refused", f"commande inconnue : {command}"
             targets = list(self.unit_agents) if target in (None, "", "all") else [target]
@@ -676,6 +734,124 @@ class Orchestrator:
             return "done", f"{command} : {', '.join(targets)}"
         except PermissionError as exc:
             return "refused", str(exc)
+
+    # --- pilotage des agents depuis l'interface (activer, désactiver, budget) ---
+    def _enable(self, name: str, params: dict) -> None:
+        from orchestre.runtime import builder
+        if name == "legacy":
+            raise ValueError("l'agent existant (S-8) n'est pas activable depuis l'interface : il charge du code, réservé à la configuration")
+        if params:
+            section = {k: v for k, v in params.items() if k != "promoted"}   # la promotion en réel reste une décision humaine hors de l'interface (§14)
+            section["enabled"] = True
+        else:
+            section = {**self.specs[name], "enabled": True}
+        for symbol in builder.strategy_symbols({"strategies": {name: section}}):
+            ensure = getattr(self.exchange, "ensure_symbol", None)
+            if ensure is not None:
+                ensure(symbol)
+            self.exchange.get_filters(symbol)
+            self.exchange.get_price(symbol)          # une paire que l'exchange ne connaît pas bloquerait tout le tick
+        builder.add_strategy(name, section, self, self.exchange, self.clock.now())
+
+    def _command_enable(self, target: str | None) -> tuple[str, str]:
+        from orchestre.config import ConfigError
+        from orchestre.runtime import builder
+        import json
+        name, _, raw = (target or "").partition("|")
+        if name not in builder.KNOWN:
+            return "refused", f"stratégie inconnue : {name or '?'}"
+        agent_id = name
+        if agent_id in self.units:
+            return "refused", f"{agent_id} est déjà actif"
+        params: dict = {}
+        if raw:
+            try:
+                params = json.loads(raw)
+            except ValueError:
+                return "refused", "paramètres invalides (JSON attendu)"
+            if not isinstance(params, dict):
+                return "refused", "paramètres invalides (objet attendu)"
+        elif name not in self.specs:
+            return "refused", f"paramètres requis pour activer {name} (aucune configuration connue)"
+        try:
+            self._enable(name, params)
+        except KeyError as exc:
+            return "refused", f"paire inconnue de l'exchange : {exc.args[0]}"
+        except (ConfigError, ValueError) as exc:
+            return "refused", str(exc)
+        except Exception as exc:
+            return "refused", f"activation impossible : {exc!r}"
+        if params:
+            self.state.dynamic[name] = {k: v for k, v in params.items() if k != "promoted"}
+            self.specs[name] = {**params, "enabled": True}
+        if name in self.state.disabled:
+            self.state.disabled.remove(name)
+        return "done", f"{name} activé"
+
+    def _command_disable(self, target: str | None) -> tuple[str, str]:
+        unit = self.units.get(target or "")
+        if unit is None:
+            return "refused", f"agent inconnu : {target or '?'}"
+        unit.disabling = True
+        if hasattr(unit.runner, "suspended"):
+            unit.runner.suspended = True                # sort de ses positions (stops conservés jusqu'à la sortie)
+        return "done", f"désactivation de {target} en cours : positions et ordres d'abord soldés"
+
+    def _command_set_budget(self, target: str | None) -> tuple[str, str]:
+        agent_id, _, raw = (target or "").partition("|")
+        try:
+            amount = Decimal(raw)
+            if not amount.is_finite() or amount <= 0:
+                raise ValueError
+        except (ArithmeticError, ValueError):
+            return "refused", f"montant invalide : {raw!r}"
+        unit = self.units.get(agent_id)
+        if unit is None:
+            return "refused", f"agent inconnu : {agent_id or '?'}"
+        if unit.kind not in ("exposure", "portfolio", "marketmaker", "legacy"):
+            return "refused", f"le budget de {agent_id} ({unit.kind}) est fixé par sa configuration et ne se change pas à chaud"
+        acc = self.ledger.account(agent_id)
+        target_alloc = amount / 2 if self.state.tier1_applied else amount
+        others = sum((a.allocated for a in self.ledger.accounts() if a.agent_id != agent_id), Decimal("0"))
+        investable = self.ledger.total * (1 - self.settings.treasury_reserve_pct)
+        if others + target_alloc > investable:
+            return "refused", f"budgets {others + target_alloc} > capital investissable {investable}"
+        if target_alloc < acc.committed:
+            return "refused", f"{acc.committed} est déjà engagé par {agent_id} : sortir de la position d'abord"
+        if target_alloc > acc.allocated:
+            self.ledger.allocate(agent_id, target_alloc - acc.allocated)
+        elif target_alloc < acc.allocated:
+            self.ledger.deallocate(agent_id, acc.allocated - target_alloc)
+        flow = self.state.flows.get(agent_id)
+        if flow is not None:
+            flow["start"] += amount - unit.budget       # le capital ajouté ou retiré n'est ni un gain ni une perte
+        unit.budget = amount
+        self.state.budgets[agent_id] = amount
+        return "done", f"budget de {agent_id} fixé à {amount}"
+
+    def _remove_unit(self, agent_id: str) -> None:
+        unit = self.units.pop(agent_id, None)
+        self.unit_agents.pop(agent_id, None)
+        self.supervisor.unregister(agent_id)
+        if unit is not None:
+            free = self.ledger.account(agent_id).available
+            if free > 0:
+                self.ledger.deallocate(agent_id, free)
+
+    def _finish_disabling(self) -> None:
+        for agent_id, unit in list(self.units.items()):
+            if not unit.disabling:
+                continue
+            if unit.kind in ("grid", "dca"):
+                self.svc.cancel_all_open(unit.symbol, agent_id, keep_protective=False)
+            if unit.positioned or self.svc.open_order_count(agent_id) > 0:
+                continue
+            self._remove_unit(agent_id)
+            self.state.dynamic.pop(agent_id, None)
+            self.state.budgets.pop(agent_id, None)
+            if agent_id not in self.state.disabled:
+                self.state.disabled.append(agent_id)
+            self.alerts.send("INFO", f"agent {agent_id} désactivé")
 
     def _log_new_rejections(self, agent_id: str, unit: _Unit) -> None:
         rejections = getattr(unit.runner, "rejections", [])
@@ -695,6 +871,13 @@ class Orchestrator:
             "agents": {aid: a.state.value for aid, a in self.unit_agents.items()},
             "codes": {aid: u.code for aid, u in self.units.items()},
             "paused_pairs": dict(self.sentiment_state.reasons),
+            "kinds": {aid: u.kind for aid, u in self.units.items()},
+            "budgets": {aid: str(u.budget) for aid, u in self.units.items()},
+            "symbols": {aid: list(u.symbols) for aid, u in self.units.items()},
+            "positioned": {aid: u.positioned for aid, u in self.units.items()},
+            "disabling": [aid for aid, u in self.units.items() if u.disabling],
+            "disabled": list(self.state.disabled),
+            "agent_params": {k: v for k, v in self.state.dynamic.items()},
         }
 
     # --- arrêts ---

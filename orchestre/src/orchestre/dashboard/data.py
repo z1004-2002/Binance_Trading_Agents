@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from orchestre.analysis.regimes import Regime
+from orchestre.dashboard.catalog import CATALOG, Entry
 from orchestre.metrics.performance import max_drawdown, sharpe, sortino, total_return
 from orchestre.portfolio.allocator import MULTIPLIERS
 
@@ -16,6 +17,14 @@ from orchestre.portfolio.allocator import MULTIPLIERS
 class DashboardData:
     def __init__(self, db_path, stop_file, clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         self._path, self._stop_file, self._clock = Path(db_path), Path(stop_file), clock
+        self.twin: "DashboardData | None" = None     # jumeau numérique : réplique papier de la même configuration, sa propre base
+
+    def exists(self) -> bool:
+        return self._path.exists()
+
+    def active_twin(self) -> "DashboardData | None":
+        """Le jumeau, une fois que son moteur a créé sa base (elle peut apparaître après le démarrage du tableau de bord)."""
+        return self.twin if self.twin is not None and self.twin.exists() else None
 
     def _connect(self) -> sqlite3.Connection:
         try:
@@ -158,3 +167,63 @@ class DashboardData:
                     "sharpe": sharpe(daily), "sortino": sortino(daily),
                 }
         return out
+
+    # --- catalogue, détail d'un agent, jumeaux ---
+    def agent_orders(self, agent_id: str, limit: int = 30) -> list[dict]:
+        return self._rows("select * from order_log where agent_id = ? order by id desc limit ?", (agent_id, limit))
+
+    def order_stats(self) -> dict[str, dict]:
+        """Par agent : nombre d'ordres exécutés et frais payés (base du suivi des coûts, comparés au jumeau)."""
+        rows = self._rows(
+            "select agent_id, count(*) as n, coalesce(sum(cast(fee as real)), 0) as fees from order_log "
+            "where status in ('FILLED', 'PARTIALLY_FILLED') group by agent_id"
+        )
+        return {r["agent_id"]: {"orders": r["n"], "fees": r["fees"]} for r in rows}
+
+    def stage(self, code: str) -> str:
+        rows = self._rows("select to_stage from lifecycle_events where agent_code = ? order by id desc limit 1", (code,))
+        return rows[0]["to_stage"] if rows else "BACKTEST"
+
+    def lifecycle(self, code: str) -> list[dict]:
+        return self._rows("select * from lifecycle_events where agent_code = ? order by id desc limit 10", (code,))
+
+    def last_value(self, agent_id: str) -> float | None:
+        rows = self._rows("select equity from equity_snapshots where series = ? order by ts desc, id desc limit 1", (f"agent:{agent_id}",))
+        return rows[0]["equity"] if rows else None
+
+    def status_of(self, entry: Entry, info: dict | None = None) -> tuple[str, str]:
+        """(gravité, texte) de l'état d'une entrée du catalogue."""
+        info = self.info() if info is None else info
+        if not entry.implemented:
+            return "muted", "Non implémenté"
+        agents = info.get("agents") or {}
+        if entry.controllable or entry.id == "legacy":
+            if entry.id in (info.get("disabling") or []):
+                return "warn", "Désactivation en cours"
+            if entry.id in agents:
+                text = {"RUNNING": "En marche", "PAUSED": "En pause", "DEGRADED": "Dégradé", "STOPPED": "Arrêté"}.get(agents[entry.id], agents[entry.id])
+                kind = {"RUNNING": "ok", "PAUSED": "warn"}.get(agents[entry.id], "crit")
+                return kind, text + (" · simulation seule" if entry.paper_only else "")
+            if entry.id in (info.get("disabled") or []):
+                return "muted", "Désactivé"
+            return "muted", "Inactif" if info else "État inconnu"
+        if not info:
+            return "muted", "État inconnu"
+        if entry.id == "assistant":
+            return "muted", "Processus séparé"
+        return "ok", "Actif (cœur)" if entry.group != "Analyse" else "Actif"
+
+    def catalog(self) -> list[dict]:
+        info = self.info()
+        accounts = {a["agent_id"]: a for a in self.ledger()["accounts"]}
+        rows = []
+        for entry in CATALOG:
+            kind, text = self.status_of(entry, info)
+            account = accounts.get(entry.id)
+            rows.append({
+                "entry": entry, "kind": kind, "status": text, "active": entry.id in (info.get("agents") or {}),
+                "allocated": account["allocated"] if account else None, "committed": account["committed"] if account else None,
+                "value": self.last_value(entry.id) if entry.controllable else None,
+                "budget": (info.get("budgets") or {}).get(entry.id),
+            })
+        return rows

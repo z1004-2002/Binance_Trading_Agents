@@ -107,51 +107,60 @@ def strategy_symbols(raw: dict) -> set[str]:
     return symbols
 
 
+def add_strategy(name: str, section: dict, orch: Orchestrator, exchange: Exchange, now: datetime) -> None:
+    """Construit un agent de stratégie depuis sa section de configuration et l'ajoute à l'équipe."""
+    if name in EXPOSURE or name in OTHERS:
+        try:
+            (_add_exposure_strategy if name in EXPOSURE else _add_other_strategy)(name, section, orch)
+        except ConfigError:
+            raise
+        except (ValueError, TypeError) as exc:
+            raise ConfigError(f"strategies.{name} : {exc}") from exc
+        orch.specs[name] = section
+        return
+    symbol = str(_field(section, "symbol", name))
+    filters = exchange.get_filters(symbol)
+    try:
+        if name == "dca":
+            start = datetime.fromisoformat(section["start"]) if "start" in section else now
+            orch.add_dca(
+                DcaConfig(
+                    agent_id="dca", symbol=symbol, amount_quote=_dec(section, "amount_quote", name),
+                    interval=timedelta(days=int(_field(section, "interval_days", name))), start=start,
+                    cumulative_cap=_dec(section, "cumulative_cap", name), min_notional=filters.min_notional,
+                    missed_policy=section.get("missed_policy", "skip"), modulated=bool(section.get("modulated", False)),
+                )
+            )
+        else:
+            orch.add_grid(
+                GridConfig(
+                    agent_id="grid", symbol=symbol, lower=_dec(section, "lower", name),
+                    upper=_dec(section, "upper", name), intervals=int(_field(section, "intervals", name)),
+                    budget_quote=_dec(section, "budget_quote", name), fee_rate=_dec(section, "fee_rate", name, "0.001"),
+                    min_notional=filters.min_notional, tick_size=filters.tick_size, step_size=filters.step_size,
+                ),
+                exit_policy=section.get("exit_policy", "pause"),
+            )
+    except ValueError as exc:
+        if isinstance(exc, ConfigError):
+            raise
+        raise ConfigError(f"strategies.{name} : {exc}") from exc
+    orch.specs[name] = section
+
+
 def build_team(raw: dict, orch: Orchestrator, exchange: Exchange, now: datetime) -> list[str]:
     sections = raw.get("strategies", {})
     for name in sections:
         if name not in KNOWN:
             raise ConfigError(f"stratégie inconnue : {name!r}")
+    for name, section in sections.items():
+        if isinstance(section, dict):
+            orch.specs.setdefault(name, section)       # même désactivée dans le fichier, une stratégie peut être activée depuis l'interface
     added: list[str] = []
     for name in KNOWN:
         section = sections.get(name)
         if not section or not section.get("enabled", False):
             continue
-        if name in EXPOSURE or name in OTHERS:
-            try:
-                (_add_exposure_strategy if name in EXPOSURE else _add_other_strategy)(name, section, orch)
-            except ConfigError:
-                raise
-            except (ValueError, TypeError) as exc:
-                raise ConfigError(f"strategies.{name} : {exc}") from exc
-            added.append(name)
-            continue
-        symbol = str(_field(section, "symbol", name))
-        filters = exchange.get_filters(symbol)
-        try:
-            if name == "dca":
-                start = datetime.fromisoformat(section["start"]) if "start" in section else now
-                orch.add_dca(
-                    DcaConfig(
-                        agent_id="dca", symbol=symbol, amount_quote=_dec(section, "amount_quote", name),
-                        interval=timedelta(days=int(_field(section, "interval_days", name))), start=start,
-                        cumulative_cap=_dec(section, "cumulative_cap", name), min_notional=filters.min_notional,
-                        missed_policy=section.get("missed_policy", "skip"), modulated=bool(section.get("modulated", False)),
-                    )
-                )
-            else:
-                orch.add_grid(
-                    GridConfig(
-                        agent_id="grid", symbol=symbol, lower=_dec(section, "lower", name),
-                        upper=_dec(section, "upper", name), intervals=int(_field(section, "intervals", name)),
-                        budget_quote=_dec(section, "budget_quote", name), fee_rate=_dec(section, "fee_rate", name, "0.001"),
-                        min_notional=filters.min_notional, tick_size=filters.tick_size, step_size=filters.step_size,
-                    ),
-                    exit_policy=section.get("exit_policy", "pause"),
-                )
-        except ValueError as exc:
-            if isinstance(exc, ConfigError):
-                raise
-            raise ConfigError(f"strategies.{name} : {exc}") from exc
+        add_strategy(name, section, orch, exchange, now)
         added.append(name)
     return added

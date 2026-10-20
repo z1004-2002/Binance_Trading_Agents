@@ -53,3 +53,25 @@ budget_quote = "100"
 band = "0.05"
 [strategies.rebalance.weights]
 BTCUSDT = "0.5"
+
+[strategies.triangular]        # S-9a arbitrage triangulaire : OBSERVATION seulement, aucun ordre, aucun budget
+enabled = false
+a = "BTC"
+b = "ETH"
+notional = "100"               # taille de l'ordre simulé pour la profondeur du carnet
+threshold = "0.0005"           # écart net (après frais et glissement) à signaler
+
+[strategies.marketmaker]       # S-9b tenue de marché : SIMULATION UNIQUEMENT (mode paper), refusée sur l'exchange réel ou testnet
+enabled = false
+symbol = "BTCUSDT"
+budget_quote = "100"
+half_spread = "0.003"
+quote_size_pct = "0.25"
+max_inventory_pct = "0.5"
+
+[strategies.legacy]            # S-8 agent du système existant, via l'adaptateur (audit du fichier, ordres soumis au risque)
+enabled = false
+path = "legacy/mon_agent.py"   # un seul fichier, sans clé en clair, sans ordre direct ni retrait (sinon refusé)
+class = "MonAgent"             # doit avoir decide(snapshot) -> liste d'intentions
+symbols = ["BTCUSDT"]
+budget_quote = "100"

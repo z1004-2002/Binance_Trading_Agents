@@ -68,9 +68,9 @@ TREND = 'trend|{"symbol": "BTCUSDT", "budget_quote": "100"}'
 
 def test_every_agent_gets_its_own_equity_curve_from_its_fills(tmp_path):
     orch, ex, clock, store = world(tmp_path)
-    tick(orch, clock)
+    tick(orch, clock, 4)                                                                # 80 minutes : un 2e relevé horaire, après l'achat
     series = store.equity_series("agent:dca")
-    assert len(series) == 1 and D("99.9") < D(str(series[0][1])) <= D("100")          # budget 100, frais payés ~0,02
+    assert len(series) == 2 and series[0][1] == 40.0 and 39.9 < series[-1][1] < 40.0     # budget 40 (plafond), frais payés ~0,02
 
 
 def test_agent_flows_survive_a_restart(tmp_path):
@@ -154,7 +154,8 @@ def test_disable_with_an_open_position_waits_for_the_exit(tmp_path):
     assert not orch.units["scripted"].positioned if "scripted" in orch.units else True
     tick(orch, clock)
     assert "scripted" not in orch.units
-    assert ex.get_open_orders("BTCUSDT") == [] and ex.get_balances().get("BTC", D("0")) == 0
+    assert ex.get_open_orders("BTCUSDT") == []
+    assert orch.state.flows["scripted"]["qty"]["BTCUSDT"] == 0                    # position soldée (le BTC restant est celui du DCA)
 
 
 def test_disabling_an_unknown_agent_is_refused(tmp_path):
@@ -228,3 +229,21 @@ def test_runtime_info_lists_the_parameters_of_active_agents_and_the_disabled_one
     tick(orch, clock, 2)
     info = store.load_state("runtime_info")
     assert info["disabled"] == ["dca"] and info["agent_params"] == {} or "dca" not in info["agent_params"]
+
+
+def test_enable_on_a_pair_the_paper_exchange_did_not_know_adds_it_on_the_fly(tmp_path):
+    orch, ex, clock, store = world(tmp_path, paper=True)
+    ex._market._filters["ETHUSDT"] = SymbolFilters("ETHUSDT", D("0.01"), D("0.0001"), D("0.0001"), D("1000"), D("5"))
+    ex._market._prices["ETHUSDT"] = D("3000")
+    ex._market.set_candles("ETHUSDT", "1d", make_candles([3000.0] * 300))
+    command(store, clock, "enable", 'trend|{"symbol": "ETHUSDT", "budget_quote": "100"}')
+    tick(orch, clock)
+    assert last(store)["status"] == "done" and orch.units["trend"].symbol == "ETHUSDT"
+
+
+def test_enable_on_a_pair_the_exchange_does_not_list_is_refused_with_a_clear_reason(tmp_path):
+    orch, ex, clock, store = world(tmp_path)
+    command(store, clock, "enable", 'trend|{"symbol": "ZZZUSDT", "budget_quote": "100"}')
+    tick(orch, clock)
+    assert last(store)["status"] == "refused" and "ZZZUSDT" in last(store)["result"] and "inconnue" in last(store)["result"]
+    assert "trend" not in orch.units

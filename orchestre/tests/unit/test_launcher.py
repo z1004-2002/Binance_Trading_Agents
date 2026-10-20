@@ -288,3 +288,43 @@ def test_read_env_names_returns_lengths_never_values(tmp_path):
     assert names == {"BINANCE_TESTNET_API_KEY": 12, "GROQ_MODEL": 6}
     assert "abcdef123456" not in repr(names)
     assert read_env_names(tmp_path / "absent") == {}
+
+
+# --- jumeau numérique ---
+
+def test_twin_runs_the_same_config_in_paper_on_its_own_database_and_stop_file(tmp_path):
+    present = {"DASHBOARD_PASSWORD": 12, "BINANCE_TESTNET_API_KEY": 5, "BINANCE_TESTNET_API_SECRET": 5}
+    plan = plan_components(args(tmp_path, mode="testnet", twin=True, db=str(tmp_path / "testnet.db")), present, FREE)
+    by_name = {c.name: c.argv for c in plan.components}
+    twin, main, dash = by_name["jumeau"], by_name["moteur"], by_name["tableau de bord"]
+    assert "--paper" in twin and "--paper" not in main
+    assert twin[twin.index("--db") + 1] == str(tmp_path / "testnet-twin.db") != main[main.index("--db") + 1]
+    assert twin[twin.index("--stop-file") + 1] == str(tmp_path / "STOP") + "-twin"           # un arrêt du réel n'efface pas le jumeau
+    assert twin[twin.index("--config") + 1] == main[main.index("--config") + 1]
+    assert dash[dash.index("--twin-db") + 1] == str(tmp_path / "testnet-twin.db")
+
+
+def test_no_twin_by_default(tmp_path):
+    plan = plan_components(args(tmp_path), {"DASHBOARD_PASSWORD": 12}, FREE)
+    assert "jumeau" not in [c.name for c in plan.components] and all("--twin-db" not in c.argv for c in plan.components)
+
+
+def test_a_twin_of_a_paper_system_is_flagged_as_nearly_redundant(tmp_path):
+    plan = plan_components(args(tmp_path, twin=True), {"DASHBOARD_PASSWORD": 12}, FREE)
+    assert any("jumeau" in w for w in plan.warnings)
+
+
+def test_a_port_in_time_wait_after_a_recent_stop_counts_as_free():
+    import socket
+    from orchestre.launcher import port_is_free
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    port = server.getsockname()[1]
+    client = socket.create_connection(("127.0.0.1", port))
+    conn, _ = server.accept()
+    conn.close()
+    client.close()                                    # la fermeture côté serveur d'abord laisse le port en TIME_WAIT
+    server.close()
+    assert port_is_free(port)

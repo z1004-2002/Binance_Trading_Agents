@@ -21,5 +21,8 @@ Une carte par agent (C-06). Chaque carte relie l'agent aux notions du cours et d
 | S-5 Retour à la moyenne | Acheter un excès baissier (sous la bande de Bollinger basse avec RSI bas) et sortir au ret… | [s5-meanreversion.md](s5-meanreversion.md) |
 | S-6 Rotation momentum | Chaque semaine, détenir les 3 cryptos au meilleur rendement sur 21 jours à poids égaux ; t… | [s6-rotation.md](s6-rotation.md) |
 | S-7 Rééquilibrage à poids constants | Garder des poids fixes (ex. 50 % BTC / 50 % liquidités) en rééquilibrant quand un poids dé… | [s7-rebalance.md](s7-rebalance.md) |
+| S-8 Agents du système existant | Adaptateur : un agent hérité passe par le risque et l'exécuteur, après audit de son fichier. | [s8-legacy.md](s8-legacy.md) |
+| S-9a Arbitrage triangulaire | Mesurer l'écart net d'un triangle de paires ; n'envoie jamais d'ordre. | [s9a-triangular.md](s9a-triangular.md) |
+| S-9b Tenue de marché | Coter achat et vente autour du prix, simulation uniquement. | [s9b-marketmaker.md](s9b-marketmaker.md) |
 
 **Non implémenté** : `UniverseAgent` (choix hebdomadaire des paires négociables, EX-AN-04), instruments avancés (futures, marge, Earn : règles R-17 à R-20 et stratégies S-10 à S-14 sont seulement dans la spécification, désactivées).
