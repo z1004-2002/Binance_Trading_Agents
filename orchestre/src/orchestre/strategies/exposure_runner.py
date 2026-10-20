@@ -74,6 +74,9 @@ class ExposureRunner:
         _load_state(self.strategy, state["strategy"])
         self._last = datetime.fromisoformat(state["last"]) if state["last"] else None
 
+    def emergency_stop(self, price: Decimal, liquidate: bool) -> None:
+        self.leg.shutdown(price, liquidate)
+
     def step(self, now: datetime, price: Decimal) -> None:
         self.leg.sync()
         self.leg.guard(price)
@@ -104,10 +107,9 @@ class ExposureRunner:
 
         target = self.strategy.target(report.accepted, self.leg.qty)
         if target.exposure is None:
-            if target.stop is not None:
-                self.leg.wanted_stop = target.stop
+            self.leg.propose_stop(target.stop)
         else:
-            self.leg.wanted_stop = target.stop
+            self.leg.propose_stop(target.stop)
             equity = self.equity(price)
             self.leg.set_target(target.exposure * equity / price, price, equity)
         self.leg.ensure_protection(price)
@@ -173,6 +175,11 @@ class PortfolioRunner:
         _load_state(self.strategy, state["strategy"])
         self._last = datetime.fromisoformat(state["last"]) if state["last"] else None
 
+    def emergency_stop(self, prices: dict[str, Decimal], liquidate: bool) -> None:
+        for s, leg in self.legs.items():
+            if s in prices:
+                leg.shutdown(prices[s], liquidate)
+
     def step(self, now: datetime, prices: dict[str, Decimal]) -> None:
         for s, leg in self.legs.items():
             leg.sync()
@@ -224,7 +231,7 @@ class PortfolioRunner:
                 if weight > 0:
                     explicit = target.stops.get(s)
                     if explicit is not None:
-                        leg.wanted_stop = explicit
+                        leg.propose_stop(explicit)
                     elif leg.wanted_stop is None or leg.qty == 0:
                         leg.wanted_stop = price * (1 - self._default_stop)
                 leg.set_target(weight * equity / price, price, equity)

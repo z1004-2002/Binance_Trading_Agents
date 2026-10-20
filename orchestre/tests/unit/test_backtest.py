@@ -158,3 +158,26 @@ def test_weekly_dca_ramps_up_one_slice_per_week():
     exposures = {i: s.target(days[: i + 1], D("0")).exposure for i in range(40)}
     acted = {i: e for i, e in exposures.items() if e is not None}
     assert acted == {0: D("0.25"), 7: D("0.5"), 14: D("0.75"), 21: D("1")}
+
+
+# --- les stops sont à cliquet : ils ne descendent jamais tant que la position est ouverte (C-08) ---
+
+def test_a_stop_is_never_lowered_while_the_position_is_open():
+    candles = [bar(0, 100, 101, 99, 100), bar(1, 100, 101, 99, 100), bar(2, 100, 101, 99, 100), bar(3, 100, 101, 80, 85)]
+    s = Scripted([Target(D("1"), stop=D("95")), Target(D("1"), stop=D("70"))])      # la 2e cible voudrait ABAISSER le stop à 70
+    r = run_backtest(candles, s, NO_FRICTION)
+    assert [t for t in r.trades if t.reason == "stop"][0].price == D("95")             # le stop à 95 a tenu
+
+
+def test_a_stop_can_still_be_raised():
+    candles = [bar(0, 100, 101, 99, 100), bar(1, 100, 101, 99, 100), bar(2, 110, 111, 109, 110), bar(3, 110, 111, 100, 105)]
+    s = Scripted([Target(D("1"), stop=D("90")), Target(D("1"), stop=D("105"))])
+    r = run_backtest(candles, s, NO_FRICTION)
+    assert [t for t in r.trades if t.reason == "stop"][0].price == D("105")
+
+
+def test_a_new_position_after_an_exit_starts_with_a_fresh_stop():
+    candles = [bar(i, 100, 101, 99, 100) for i in range(8)]
+    s = Scripted([Target(D("1"), stop=D("95")), Target(D("0")), Target(D("1"), stop=D("50"))])
+    r = run_backtest(candles, s, NO_FRICTION)
+    assert len([t for t in r.trades if t.side == "BUY"]) == 2                           # le stop 50 est accepté à la ré-entrée

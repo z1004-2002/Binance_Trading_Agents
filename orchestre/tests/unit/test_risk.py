@@ -145,3 +145,18 @@ def test_reduction_still_blocked_by_kill_switch_and_wrong_env():
     sell = proposal(side=Side.SELL, reduces_risk=True)
     assert review(sell, context(kill_switch=True)).rule_id == "R-01"
     assert review(replace(sell, env=Env.LIVE), context()).rule_id == "R-02"
+
+
+# --- sortie d'urgence sous kill switch (réduction de risque uniquement, C-08) ---
+
+def test_an_emergency_exit_passes_the_kill_switch_but_nothing_else_does():
+    sell = proposal(side=Side.SELL, reduces_risk=True, emergency=True)
+    assert review(sell, context(kill_switch=True)).approved
+    assert review(sell, context(kill_switch=True, agent_running=False)).approved
+    assert review(proposal(side=Side.SELL, reduces_risk=True), context(kill_switch=True)).rule_id == "R-01"       # vente ordinaire : bloquée
+    assert review(proposal(side=Side.BUY, emergency=True), context(kill_switch=True)).rule_id == "R-01"           # un achat n'est jamais « d'urgence »
+    assert review(replace(sell, env=Env.LIVE), context(kill_switch=True)).rule_id == "R-02"                         # l'environnement reste vérifié
+
+
+def test_an_emergency_flag_without_risk_reduction_is_ignored():
+    assert review(proposal(side=Side.SELL, emergency=True), context(kill_switch=True)).rule_id == "R-01"

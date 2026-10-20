@@ -38,6 +38,8 @@ Check = Callable[[OrderProposal, RiskContext], str | None]
 
 
 def _r01(p: OrderProposal, c: RiskContext) -> str | None:
+    if p.emergency and p.reduces_risk and p.side is Side.SELL:
+        return None  # sortie d'urgence d'une position dont le stop a échoué : réduit le risque, donc autorisée (C-08)
     if c.kill_switch:
         return "kill switch actif"
     if not c.agent_running:

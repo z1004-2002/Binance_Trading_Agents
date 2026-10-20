@@ -22,6 +22,7 @@ from orchestre.assistant.news import default_fetch as news_default_fetch, pairs_
 from orchestre.assistant.tools import ToolBox
 from orchestre.assistant.worker import run_worker
 from orchestre.dashboard.data import DashboardData
+from orchestre.experiment.protocol import ProtocolError, evaluate, load_protocol, start_experiment, verify_experiment
 from orchestre.audit.legacy import SEVERITIES, render_markdown, scan
 from orchestre.dashboard.server import DashboardServer
 from orchestre.cli.backtest_cmds import (
@@ -351,6 +352,35 @@ def _cmd_news(args, environ, out, err) -> int:
     return 0
 
 
+def _cmd_experiment(args, out, err) -> int:
+    """Protocole d'expérience (EX-XP-01) : figer les critères avant de commencer, puis juger sans les changer."""
+    try:
+        if not Path(args.db).exists():
+            raise ConfigError(f"base introuvable : {args.db}")
+        store = Store(Database(args.db))
+        now = SystemClock().now()
+        if args.experiment_command == "start":
+            state = start_experiment(store, args.protocol, now)
+            print(f"Expérience « {state['name']} » démarrée. Empreinte du protocole (SHA-256) : {state['sha256']}", file=out)
+            print("Ne modifie plus ce fichier : toute modification invaliderait l'expérience.", file=out)
+            return 0
+        protocol = load_protocol(args.protocol)
+        if not verify_experiment(store, args.protocol):
+            print("PROTOCOLE MODIFIÉ APRÈS LE DÉBUT (ou expérience non démarrée) : résultats invalides (EX-XP-01).", file=err)
+            return 3
+        result = evaluate(protocol, store, now)
+        print(f"{protocol.name} ({protocol.level}) : {result.days} jour(s) observé(s) sur {protocol.min_days}.", file=out)
+        for c in result.criteria:
+            print(f"  [{c.status:<8}] {c.name} : {c.detail}", file=out)
+        if result.stop_reason:
+            print(f"RÈGLE D'ARRÊT ATTEINTE : {result.stop_reason}", file=out)
+        print("Verdict : " + ("critères satisfaits (indicatif : période courte, EX-XP-05)" if result.passed else "non validé à ce stade"), file=out)
+        return 0 if result.passed else 1
+    except (ProtocolError, ConfigError) as exc:
+        print(f"Erreur : {mask_secrets(str(exc))}", file=err)
+        return 2
+
+
 def _cmd_kill(args, out) -> int:
     stop = Path(args.stop_file)
     stop.parent.mkdir(parents=True, exist_ok=True)
@@ -445,6 +475,12 @@ def build_parser() -> argparse.ArgumentParser:
     nw.add_argument("--env-file", default=".env")
     nw.add_argument("--rss", action="append", required=True, help="URL d'un flux RSS ou Atom (répétable)")
     nw.add_argument("--assets", default="BTC,ETH,SOL,BNB,XRP")
+    ex = sub.add_parser("experiment")
+    ex_sub = ex.add_subparsers(dest="experiment_command", required=True)
+    for name in ("start", "status"):
+        sp = ex_sub.add_parser(name)
+        sp.add_argument("--protocol", required=True)
+        sp.add_argument("--db", default="var/orchestre.db")
     ds = sub.add_parser("dashboard")
     ds.add_argument("--db", default="var/orchestre.db")
     ds.add_argument("--stop-file", default="var/STOP")
@@ -489,6 +525,8 @@ def main(
         }
         if args.command in backtests:
             return backtests[args.command](args, out, err, public_client_factory or create_public_client)
+        if args.command == "experiment":
+            return _cmd_experiment(args, out, err)
         if args.command == "assistant":
             return _cmd_assistant(args, environ, out, err)
         if args.command == "news":

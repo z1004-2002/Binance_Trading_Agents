@@ -43,3 +43,8 @@ def test_rejects_filter_violation(ex):
 def test_sell_requires_holdings(ex):
     r = ex.place_order(OrderRequest("BTCUSDT", Side.SELL, D("0.001"), None, "s1"))
     assert r.status == "REJECTED"
+
+
+def test_market_orders_do_not_need_a_tick_aligned_reference_price(ex):
+    ex.set_price("BTCUSDT", D("59876.123456789"))
+    assert ex.place_order(buy("0.001", "m1")).status == "FILLED"

@@ -1,0 +1,17 @@
+# Protocole E-1 : simulation (paper) sur marché réel, niveau L0 (spec §16.4, EX-XP-01).
+# À FIGER AVANT DE COMMENCER : `orchestre experiment start` enregistre l'empreinte de ce fichier ; toute modification
+# ensuite invalide l'expérience (les critères ne se changent pas en cours de route).
+name = "E-1 simulation paper"
+level = "L0"
+min_days = 30
+
+[success]                       # critères à confirmer par le porteur (Q-9) avant le démarrage
+max_drawdown = 0.15             # drawdown maximal de l'équipe
+drawdown_below_reference = true # drawdown inférieur à celui de la détention de BTC (série REF_BTCUSDT)
+sortino_at_least_reference = true
+max_critical_incidents = 0      # ordre en double, plafond dépassé, registre incohérent
+max_fees_pct_of_capital = 0.02  # frais totaux / capital plafonné
+
+[stop]                          # règles d'arrêt : retour en L0 si l'une est atteinte
+drawdown = 0.15
+critical_incidents = 2

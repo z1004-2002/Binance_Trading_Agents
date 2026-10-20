@@ -1,0 +1,15 @@
+# Protocole E-2 : pilote réel, petit capital plafonné, niveau L2 (spec §16.4). N'est utilisable qu'après la porte du §20.
+name = "E-2 pilote réel"
+level = "L2"
+min_days = 90
+
+[success]
+max_drawdown = 0.15
+drawdown_below_reference = true
+sortino_at_least_reference = true
+max_critical_incidents = 0
+max_fees_pct_of_capital = 0.02
+
+[stop]
+drawdown = 0.15
+critical_incidents = 2

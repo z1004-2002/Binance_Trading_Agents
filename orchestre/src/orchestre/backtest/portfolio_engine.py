@@ -124,14 +124,19 @@ def run_portfolio_backtest(
         pending = strategy.target(histories, positions, last_equity)
         if pending.weights is not None:
             _check_weights(pending.weights)
-            stops = dict(pending.stops)
+            stops = {sym: _ratchet(stops.get(sym), stop, book.qty.get(sym, Decimal("0"))) for sym, stop in pending.stops.items()}
         elif pending.stops:
-            stops.update(pending.stops)
+            stops.update({sym: _ratchet(stops.get(sym), stop, book.qty.get(sym, Decimal("0"))) for sym, stop in pending.stops.items()})
 
     return BacktestResult(
         strategy.name, dates, equity, book.trades, book.fees, book.traded,
         getattr(strategy, "params_tried", 1), book.cash, cfg.periods_per_year,
     )
+
+
+def _ratchet(old: Decimal | None, new: Decimal, held: Decimal) -> Decimal:
+    """Un stop ne descend pas tant que la position est ouverte (C-08)."""
+    return old if held > 0 and old is not None and new < old else new
 
 
 def _rebalance(book: _MultiBook, bars: dict[str, Candle], weights: dict[str, Decimal], equity: Decimal) -> None:

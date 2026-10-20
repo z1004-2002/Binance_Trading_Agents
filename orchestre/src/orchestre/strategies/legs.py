@@ -107,8 +107,8 @@ class Leg:
         elif report.status == "FAILURE":
             self.alert(f"achat {self.symbol} échoué : {report.reason}")
 
-    def _sell(self, qty: Decimal, price: Decimal) -> None:
-        report = self._send(self._proposal(Side.SELL, qty, price, reduces_risk=True), self._id("S"))
+    def _sell(self, qty: Decimal, price: Decimal, emergency: bool = False) -> None:
+        report = self._send(self._proposal(Side.SELL, qty, price, reduces_risk=True, emergency=emergency), self._id("S"))
         if report is None:
             return
         if report.status == "FILLED":
@@ -127,6 +127,8 @@ class Leg:
         self.net_spent -= result.filled_qty * result.avg_price - result.fee_quote
         self._drop_dust()
         self._clear_stop()
+        if self.qty <= 0:
+            self.wanted_stop = None
 
     def _cancel_stop(self) -> None:
         if self.stop_order_id is None:
@@ -138,17 +140,19 @@ class Leg:
         else:
             self._clear_stop()
 
-    def _exit(self, price: Decimal) -> None:
+    def _exit(self, price: Decimal, emergency: bool = False) -> None:
         self._cancel_stop()
         if self.qty > 0:
-            self._sell(self.qty, price)
+            self._sell(self.qty, price, emergency)
+        if self.qty <= 0:
+            self.wanted_stop = None
 
     def _place_stop(self, price: Decimal) -> None:
         if self.qty <= 0 or self.wanted_stop is None:
             return
         if self.wanted_stop >= price:
             self.alert(f"position non protégée sur {self.symbol} (stop {self.wanted_stop} >= prix {price}) : sortie d'urgence")
-            self._exit(price)
+            self._exit(price, emergency=True)
             return
         self._cancel_stop()
         if self.qty <= 0:
@@ -163,7 +167,17 @@ class Leg:
             self.stop_order_id, self.stop_price, self.stop_qty = report.result.client_order_id, self.wanted_stop, self.qty
             return
         self.alert(f"stop refusé sur {self.symbol} : position non protégée, sortie d'urgence")
-        self._exit(price)
+        self._exit(price, emergency=True)
+
+    def propose_stop(self, stop: Decimal | None) -> None:
+        """Les stops sont à cliquet : tant que la position est ouverte, un stop ne peut que monter (abaisser un stop augmente
+        le risque, donc exige une validation humaine, C-08). Une position neuve repart d'un stop frais."""
+        if stop is None:
+            return
+        floor = max((x for x in (self.wanted_stop, self.stop_price) if x is not None), default=None)
+        if self.qty > 0 and floor is not None and stop < floor:
+            return
+        self.wanted_stop = stop
 
     # --- API pour les runners ---
     def ensure_protection(self, price: Decimal) -> None:
@@ -201,4 +215,13 @@ class Leg:
         if self.qty > 0 and self.stop_order_id and self.stop_price is not None:
             if price < self.stop_price * (1 - self._buffer):
                 self.alert(f"marché sous la limite du stop sur {self.symbol} ({price}) : sortie d'urgence au marché")
-                self._exit(price)
+                self._exit(price, emergency=True)
+
+    def shutdown(self, price: Decimal, liquidate: bool) -> None:
+        """Dernière vérification avant l'arrêt global : règle les stops exécutés, sort si un stop n'a pas pu s'exécuter
+        (marché sous sa limite) et, si la politique de l'agent est de liquider, ferme la position."""
+        self.sync()
+        self.guard(price)
+        if liquidate and self.qty > 0:
+            self.alert(f"arrêt global : liquidation de la position {self.symbol}")
+            self._exit(price, emergency=True)

@@ -147,7 +147,10 @@ def run_backtest(
 
         pending = strategy.target(candles[: i + 1], book.qty)
         if pending.stop is not None or pending.exposure is not None:
-            stop = pending.stop
+            new_stop = pending.stop
+            if book.qty > 0 and stop is not None and new_stop is not None and new_stop < stop:
+                new_stop = stop  # cliquet : un stop ne descend pas tant que la position est ouverte (C-08)
+            stop = new_stop
 
     return BacktestResult(
         strategy.name, dates, equity, book.trades, book.fees, book.traded,

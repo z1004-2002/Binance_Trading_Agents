@@ -190,3 +190,66 @@ def test_paused_pairs_survive_a_restart(tmp_path):
     orch2, _, _, _ = build(tmp_path, db=db, ex=ex, clock=clock)
     orch2.restore()
     assert orch2.sentiment_state.is_paused("BTCUSDT")
+
+
+# --- autocontrôle quotidien (EX-SU-03) et remise à zéro du testnet (EX-ENV-02) ---
+
+def alerts_text(orch):
+    return " | ".join(f"{lvl}:{txt}" for lvl, txt in orch.alerts.history)
+
+
+def test_the_self_check_runs_once_per_day_and_reports_ok_when_everything_is_consistent(tmp_path):
+    orch, ex, clock, store = build(tmp_path)
+    tick(orch, clock)
+    assert orch.self_check_problems == [] and any(
+        r["kind"] == "self_check" and "OK" in r["detail"] for r in store.db.conn.execute("select * from events"))
+    n = store.db.conn.execute("select count(*) from events where kind = 'self_check'").fetchone()[0]
+    tick(orch, clock)
+    assert store.db.conn.execute("select count(*) from events where kind = 'self_check'").fetchone()[0] == n   # pas deux fois le même jour
+    clock.advance(timedelta(days=1))
+    orch.run_once()
+    assert store.db.conn.execute("select count(*) from events where kind = 'self_check'").fetchone()[0] == n + 1
+
+
+def test_a_corrupted_ledger_is_detected(tmp_path):
+    orch, ex, clock, _ = build(tmp_path)
+    tick(orch, clock)
+    orch.ledger.account("trend").committed = orch.ledger.account("trend").allocated + D("5")      # corruption volontaire
+    problems = orch.self_check()
+    assert any("registre" in p for p in problems)
+
+
+def test_a_position_without_a_protective_stop_is_critical(tmp_path):
+    orch, ex, clock, _ = build(tmp_path)
+    tick(orch, clock)
+    leg = orch.units["trend"].runner.leg
+    assert leg.qty > 0
+    leg.stop_order_id = None                                                                    # le stop a disparu
+    problems = orch.self_check()
+    assert any("sans stop" in p and "trend" in p for p in problems)
+    assert any(level == "CRITICAL" and "sans stop" in text for level, text in orch.alerts.history)
+
+
+def test_low_disk_space_is_reported(tmp_path, monkeypatch):
+    import shutil
+    from collections import namedtuple
+    usage = namedtuple("usage", "total used free")
+    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage(10**12, 10**12 - 50 * 10**6, 50 * 10**6))
+    orch, ex, clock, _ = build(tmp_path)
+    assert any("disque" in p for p in orch.self_check())
+
+
+def test_tracked_orders_missing_from_the_exchange_look_like_a_testnet_reset(tmp_path):
+    orch, ex, clock, _ = build(tmp_path)
+    tick(orch, clock)
+    for req in [*ex._stops.values(), *ex._resting.values()]:                                    # remise à zéro : fonds rendus,
+        base = req.symbol.removesuffix("USDT")                                                   # mais plus aucun ordre connu
+        if req.side.value == "SELL":
+            ex._balances[base] = ex._balances.get(base, D("0")) + req.quantity
+    ex._orders.clear()
+    ex._stops.clear()
+    ex._resting.clear()
+    assert tick(orch, clock) == "PAUSED"
+    text = alerts_text(orch)
+    assert "remise à zéro du testnet" in text
+    assert all(a.state is AgentState.PAUSED for a in orch.unit_agents.values())

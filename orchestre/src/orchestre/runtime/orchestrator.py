@@ -7,6 +7,7 @@ Un tick : kill switch -> prix -> équité et paliers de drawdown -> stratèges -
 from __future__ import annotations
 
 import asyncio
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -16,7 +17,7 @@ from typing import Awaitable, Callable
 from orchestre.analysis.regimes import Regime
 from orchestre.analysis.sentiment import SentimentState
 from orchestre.analysis.service import AnalysisService
-from orchestre.config import Settings
+from orchestre.config import Env, Settings
 from orchestre.core.agent import Agent, AgentState
 from orchestre.core.clock import Clock
 from orchestre.exchange.base import Exchange, IpBannedError
@@ -49,6 +50,7 @@ class RuntimeLimits:
     heartbeat_timeout: timedelta = timedelta(minutes=5)
     reconcile_interval: timedelta = timedelta(minutes=15)
     unit_error_threshold: int = 3
+    liquidate_on_drawdown_stop: bool = True   # au palier de 15 % les agents à exposition cible liquident (sinon : sous stop)
 
 
 @dataclass
@@ -187,6 +189,8 @@ class Orchestrator:
         self.run_mode = "exchange"
         self.sentiment_state = SentimentState()   # paires en pause sur actualité grave : réduction de risque seulement
         self._equity = Decimal("0")
+        self.self_check_problems: list[str] = []
+        self._last_self_check_day: str | None = None
         self._last_snapshot: datetime | None = None
         self._report_due: tuple[str, int] | None = None
         self._logged_rejections: dict[str, int] = {}
@@ -346,10 +350,14 @@ class Orchestrator:
             self._startup_done = True
             gaps = [g for s in symbols for g in self.svc.reconcile(s)]
             if gaps:
-                self._pause_all("réconciliation au démarrage : " + "; ".join(gaps))
+                self._pause_all(self._gap_reason("réconciliation au démarrage", gaps))
                 return "PAUSED"
 
         self._update_equity(now, equity_value)
+        if self._last_self_check_day != now.date().isoformat():
+            self._last_self_check_day = now.date().isoformat()
+            self._filters.clear()              # les filtres de symbole peuvent changer : on les relit chaque jour
+            self.self_check_problems = self.self_check()
         self._snapshot(now, symbols)
         if self._report_due is not None:
             self.alerts.send("REPORT", self._daily_report())
@@ -358,7 +366,7 @@ class Orchestrator:
             self.alerts.send("CRITICAL", f"drawdown {self._drawdown:.2%} >= 15 % : arrêt global")
             self.stop_file.parent.mkdir(parents=True, exist_ok=True)
             self.stop_file.touch()  # l'arrêt survit à un redémarrage : reprise humaine uniquement
-            return self._handle_kill("palier de drawdown 15 %")
+            return self._handle_kill("palier de drawdown 15 %", liquidate=self.limits.liquidate_on_drawdown_stop)
         if self._drawdown >= DRAWDOWN_REDUCE and not self.state.tier1_applied:
             self._reduce_budgets()
 
@@ -381,7 +389,7 @@ class Orchestrator:
         if self._reconcile_due(now):
             gaps = [g for s in symbols for g in self.svc.reconcile(s)]
             if gaps:
-                self._pause_all("écart de réconciliation : " + "; ".join(gaps))
+                self._pause_all(self._gap_reason("écart de réconciliation", gaps))
                 return self._finish("PAUSED", now)
         return self._finish("OK", now)
 
@@ -514,6 +522,47 @@ class Orchestrator:
                 self.ledger.deallocate(unit.agent_id, half)
         self.alerts.send("WARNING", f"drawdown {self._drawdown:.2%} >= 5 % : budgets réduits de moitié")
 
+    def _gap_reason(self, prefix: str, gaps: list[str]) -> str:
+        reason = f"{prefix} : " + "; ".join(gaps)
+        if self.settings.env is Env.TESTNET and any("INCONNU" in g for g in gaps):
+            reason += (" — la plateforme ne connaît plus des ordres que nous suivons : possible remise à zéro du testnet "
+                       "(EX-ENV-02). Vérifier, puis repartir d'une base neuve.")
+        return reason
+
+    # --- autocontrôle quotidien (EX-SU-03) ---
+    def self_check(self) -> list[str]:
+        """Cohérence interne : registre, ordres suivis, stops de protection, espace disque. Journalisé et alerté."""
+        problems: list[str] = []
+        accounts = self.ledger.accounts()
+        for a in accounts:
+            if a.committed > a.allocated + Decimal("0.0001") or a.allocated < 0 or a.committed < 0:
+                problems.append(f"registre incohérent pour {a.agent_id} : engagé {a.committed}, alloué {a.allocated}")
+        if sum((a.allocated for a in accounts), Decimal("0")) > self.ledger.total + Decimal("0.0001"):
+            problems.append("registre incohérent : la somme des budgets dépasse le capital plafonné")
+        tracked = sum((Decimal(r["committed"]) for r in self.svc.export_tracked()), Decimal("0"))
+        if tracked > sum((a.committed for a in accounts), Decimal("0")) + Decimal("0.0001"):
+            problems.append("ordres suivis réservant plus que le montant engagé au registre")
+        for agent_id, unit in self.units.items():
+            legs = [unit.runner.leg] if unit.kind == "exposure" else list(unit.runner.legs.values()) if unit.kind == "portfolio" else []
+            for leg in legs:
+                if leg.qty > 0 and not leg.stop_order_id:
+                    problems.append(f"position sans stop de protection : {agent_id} sur {leg.symbol} (EX-SEC-14)")
+        try:
+            free = shutil.disk_usage(Path(self.store.db.path).parent if self.store.db.path != ":memory:" else Path(".")).free
+            if free < 200 * 10**6:
+                problems.append(f"espace disque faible : {free // 10**6} Mo libres")
+        except OSError:
+            pass
+        now = self.clock.now()
+        if problems:
+            for text in problems:
+                self.alerts.send("CRITICAL" if "sans stop" in text else "WARNING", f"autocontrôle : {text}")
+        else:
+            self.store.log_event(now, "INFO", "self_check", "autocontrôle quotidien : OK")
+        if problems:
+            self.store.log_event(now, "WARNING", "self_check", "; ".join(problems)[:900])
+        return problems
+
     # --- courbes, rapport, commandes, refus du risque ---
     def _snapshot(self, now: datetime, symbols: list[str]) -> None:
         if self._last_snapshot is not None and now - self._last_snapshot < timedelta(hours=1):
@@ -609,13 +658,38 @@ class Orchestrator:
         self.alerts.send("CRITICAL", f"équipe en pause : {reason}")
         self._persist(self.clock.now())
 
-    def _handle_kill(self, reason: str) -> str:
+    def _emergency_positions(self, liquidate: bool) -> None:
+        """Avant d'arrêter les agents : régler les stops exécutés, sortir des positions dont le stop n'a pas pu
+        s'exécuter (trou sous la limite), et liquider si la politique l'exige. Réduction de risque uniquement."""
+        symbols = sorted({sym for u in self.units.values() for sym in u.symbols})
+        for sym in symbols:
+            try:
+                self._prices[sym] = self.exchange.get_price(sym)
+            except Exception:
+                pass
+        for agent_id, unit in self.units.items():
+            if unit.kind not in ("exposure", "portfolio") or not all(s in self._prices for s in unit.symbols):
+                continue
+            try:
+                if unit.kind == "exposure":
+                    unit.runner.emergency_stop(self._prices[unit.symbol], liquidate)
+                else:
+                    unit.runner.emergency_stop({s: self._prices[s] for s in unit.symbols}, liquidate)
+            except IpBannedError:
+                self.alerts.send("CRITICAL", "IP bannie pendant l'arrêt : positions laissées sous leurs stops")
+            except Exception as exc:
+                self.alerts.send("ERROR", f"arrêt de {agent_id} : {exc!r}")
+            self._forward_runner_alerts(agent_id, unit)
+
+    def _handle_kill(self, reason: str, liquidate: bool = False) -> str:
         if not self._kill_handled:
             self._kill_handled = True
+            self._emergency_positions(liquidate)
             self.supervisor.apply_command("kill")
             for symbol in sorted({sym for u in self.units.values() for sym in u.symbols}):
                 self.svc.cancel_all_open(symbol)
-            self.alerts.send("CRITICAL", f"kill switch : {reason}; ordres ouverts annulés, agents arrêtés")
+            self.alerts.send("CRITICAL", f"kill switch : {reason}; ordres ouverts annulés (stops de protection conservés), agents arrêtés"
+                             + ("; positions à exposition cible liquidées" if liquidate else ""))
             self._persist(self.clock.now())
         return "KILLED"
 

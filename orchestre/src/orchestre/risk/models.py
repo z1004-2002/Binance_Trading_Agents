@@ -27,6 +27,7 @@ class OrderProposal:
     instrument: str = "spot"
     stop_price: Decimal | None = None   # ordre stop de protection posé chez Binance (EX-SEC-14)
     kind: str = "limit"                 # "limit" | "stop" : un stop est loin du prix par construction
+    emergency: bool = False             # sortie d'urgence (réduction de risque) : seule exception au kill switch
 
     @property
     def notional(self) -> Decimal:

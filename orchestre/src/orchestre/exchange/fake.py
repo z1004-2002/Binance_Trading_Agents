@@ -9,7 +9,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 from orchestre.exchange.base import Candle, Exchange, OrderBook, OrderRequest, OrderResult
-from orchestre.exchange.filters import FilterError, Side, SymbolFilters, validate_order
+from orchestre.exchange.filters import FilterError, Side, SymbolFilters, round_price, validate_order
 
 
 class FakeExchange(Exchange):
@@ -133,7 +133,7 @@ class FakeExchange(Exchange):
             return self._orders[key]  # idempotence (EX-ST-02)
 
         filters = self._filters[request.symbol]
-        price = request.price or self._prices[request.symbol]
+        price = request.price or round_price(self._prices[request.symbol], request.side, filters)
         try:
             validate_order(request.quantity, price, filters)
         except FilterError:

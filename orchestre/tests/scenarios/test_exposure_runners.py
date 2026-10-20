@@ -237,3 +237,21 @@ def test_portfolio_equity_accounts_for_what_was_spent_and_held():
     step_all(ex, runner, 30)
     equity = strategy.calls[-1][2]
     assert D("195") < equity < D("201")          # ~budget (frais payés) : rien n'a bougé en prix
+
+
+def test_the_protective_stop_is_a_ratchet_it_is_never_lowered_while_the_position_is_open():
+    ex, ledger, svc, runner = exposure_runner(Scripted([Target(D("0.5"), D("57000")), Target(D("0.5"), D("40000"))]))
+    advance(ex, runner, 0)
+    first = ex.get_open_orders("BTCUSDT")[0]
+    advance(ex, runner, 20, extra_candle=True)                                   # la stratégie propose 40 000 : refusé
+    stops = ex.get_open_orders("BTCUSDT")
+    assert len(stops) == 1 and stops[0].client_order_id == first.client_order_id and runner.leg.wanted_stop == D("57000")
+
+
+def test_a_fresh_position_after_a_full_exit_takes_the_new_stop():
+    ex, ledger, svc, runner = exposure_runner(Scripted([Target(D("0.5"), D("57000")), Target(D("0")), Target(D("0.5"), D("40000"))]))
+    advance(ex, runner, 0)
+    advance(ex, runner, 20, extra_candle=True)
+    assert runner.leg.qty == 0 and runner.leg.wanted_stop is None
+    advance(ex, runner, 40, extra_candle=True)
+    assert runner.leg.qty > 0 and runner.leg.wanted_stop == D("40000")
