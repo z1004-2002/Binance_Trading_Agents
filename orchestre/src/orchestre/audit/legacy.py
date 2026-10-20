@@ -60,15 +60,16 @@ class AuditReport:
     order_calls: int = 0
 
 
-def _python_files(root: Path) -> list[Path]:
-    return sorted(p for p in root.rglob("*.py") if not (set(p.relative_to(root).parts[:-1]) & SKIP_DIRS))
+def _python_files(root: Path, only: set[str] | None = None) -> list[Path]:
+    files = sorted(p for p in root.rglob("*.py") if not (set(p.relative_to(root).parts[:-1]) & SKIP_DIRS))
+    return [p for p in files if only is None or str(p.relative_to(root)) in only]
 
 
-def scan(root: str | Path) -> AuditReport:
+def scan(root: str | Path, only: set[str] | None = None) -> AuditReport:
     root = Path(root)
     report = AuditReport(str(root))
     texts: dict[str, str] = {}
-    for path in _python_files(root):
+    for path in _python_files(root, only):
         rel = str(path.relative_to(root))
         text = path.read_text(encoding="utf-8", errors="ignore")
         texts[rel] = text

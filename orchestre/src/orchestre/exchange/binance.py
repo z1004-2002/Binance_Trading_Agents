@@ -165,7 +165,13 @@ class BinanceExchange(Exchange):
         return self._to_result(raw, symbol, client_order_id)
 
     # --- interne ---
+    _QUOTES = ("USDT", "USDC", "FDUSD", "BTC", "ETH", "BNB")
+
     def _pair(self, symbol: str) -> str:
+        """BTCUSDT -> BTC/USDT ; ETHBTC -> ETH/BTC (paires croisées, arbitrage triangulaire)."""
+        for quote in (self._quote, *self._QUOTES):
+            if symbol.endswith(quote) and len(symbol) > len(quote):
+                return f"{symbol[: -len(quote)]}/{quote}"
         return f"{symbol.removesuffix(self._quote)}/{self._quote}"
 
     def _ensure_markets(self) -> None:

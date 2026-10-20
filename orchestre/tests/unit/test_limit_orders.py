@@ -153,3 +153,17 @@ def test_rejected_maker_counts_as_error():
     d = review(proposal(limit_price=D("60000")), context())
     r = svc.execute(d.order, "L9")
     assert r.status == "FAILURE" and svc.consecutive_errors == 1
+
+
+def test_sell_proceeds_never_release_the_reservation_of_a_pending_buy_order():
+    """Défaut trouvé par la tenue de marché : le produit d'une vente libérait le montant réservé par un achat limite en attente."""
+    ex, lg, svc = make()
+    bought = review(proposal(), context()).order
+    svc.execute(bought, "B1")                                                   # achat au marché : engagé 60,06
+    svc.execute(approved_limit(price="59500"), "L1")                            # achat limite en attente : réserve 59,56
+    assert lg.account("dca").committed == D("60.06") + D("59.56")
+    sell = review(proposal(side=Side.SELL, reduces_risk=True), context()).order
+    svc.execute(sell, "S1")                                                     # le produit (~60) ne libère que le coût de la position
+    assert lg.account("dca").committed >= D("59.56")                            # la réservation de L1 est intacte
+    assert svc.cancel("BTCUSDT", "L1").status == "CANCELED"                     # et son annulation ne lève plus d'erreur
+    assert D("0") <= lg.account("dca").committed < D("1")

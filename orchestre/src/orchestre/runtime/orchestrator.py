@@ -33,6 +33,9 @@ from orchestre.strategies.dca_runner import DcaRunner
 from orchestre.strategies.exposure_runner import ExposureRunner, PortfolioRunner
 from orchestre.strategies.grid import GridConfig, range_status
 from orchestre.strategies.grid_runner import GridRunner
+from orchestre.strategies.legacy import LegacyRunner
+from orchestre.strategies.marketmaker import MarketMakerRunner
+from orchestre.strategies.triangular import Triangle, TriangleObserver
 from orchestre.supervisor.service import Supervisor
 
 DRAWDOWN_REDUCE = Decimal("0.05")
@@ -119,8 +122,12 @@ class _Unit:
             self.runner.step(price)
         elif self.kind == "exposure":
             self.runner.step(now, price)
-        elif self.kind == "portfolio":
+        elif self.kind in ("portfolio", "legacy"):
             self.runner.step(now, {sym: self._prices_fn()[sym] for sym in self.symbols})
+        elif self.kind == "observer":
+            self.runner.step(now)
+        elif self.kind == "marketmaker":
+            self.runner.step(now, price)
         else:
             self.runner.step(now, price, self.fear_greed)
 
@@ -131,6 +138,8 @@ class _Unit:
             return self.runner.leg.qty > 0
         if self.kind == "portfolio":
             return any(leg.qty > 0 for leg in self.runner.legs.values())
+        if self.kind in ("marketmaker", "legacy"):
+            return self.runner.positioned
         return False
 
     def export_state(self) -> dict:
@@ -259,6 +268,35 @@ class Orchestrator:
         )
         minimum = max(self._symbol_filters(s).min_notional for s in symbols) * Decimal("1.2") * positions
         self._register(_Unit(agent_id, symbols[0], "portfolio", runner, None, budget, code=code, symbols=list(symbols),
+                             min_viable=minimum, prices_fn=lambda: self._prices))
+
+    def add_observer(self, agent_id: str, tri: Triangle, notional: Decimal, threshold: Decimal) -> None:
+        """S-9a : mesure des écarts d'arbitrage triangulaire. N'envoie aucun ordre, n'a aucun budget."""
+        runner = TriangleObserver(tri, self.exchange, Decimal("0.001"), notional, threshold)
+        self._register(_Unit(agent_id, tri.symbols[0], "observer", runner, None, Decimal("0"), code="S-9a", symbols=list(tri.symbols)))
+
+    def add_marketmaker(self, agent_id: str, symbol: str, budget: Decimal, **params) -> None:
+        """S-9b : tenue de marché, SIMULATION UNIQUEMENT (EX-ST-10) : refusée si l'exchange n'est pas l'exchange paper."""
+        if not isinstance(self.exchange, PaperExchange):
+            raise ValueError("la tenue de marché est réservée à la simulation (mode paper) : jamais d'ordres réels (EX-ST-10)")
+        self._reserve_budget(agent_id, budget)
+        runner = MarketMakerRunner(
+            symbol, symbol.removesuffix(self.settings.quote_currency), self.svc, self._context_factory(agent_id), self.exchange,
+            agent_id, lambda: self.ledger.account(agent_id).allocated, env=self.settings.env, **params,
+        )
+        minimum = self._symbol_filters(symbol).min_notional * Decimal("2.4")
+        self._register(_Unit(agent_id, symbol, "marketmaker", runner, None, budget, code="S-9b", min_viable=minimum))
+
+    def add_legacy(self, agent_id: str, agent, symbols: list[str], budget: Decimal) -> None:
+        """S-8 : agent du système existant, via l'adaptateur (ses intentions passent par le risque et l'exécuteur)."""
+        self._reserve_budget(agent_id, budget)
+        quote = self.settings.quote_currency
+        runner = LegacyRunner(
+            agent, symbols, self.svc, self._context_factory(agent_id), self.exchange, agent_id,
+            {s: s.removesuffix(quote) for s in symbols}, lambda: self.ledger.account(agent_id).allocated, env=self.settings.env,
+        )
+        minimum = max(self._symbol_filters(s).min_notional for s in symbols) * Decimal("1.2")
+        self._register(_Unit(agent_id, symbols[0], "legacy", runner, None, budget, code="S-8", symbols=list(symbols),
                              min_viable=minimum, prices_fn=lambda: self._prices))
 
     # --- contexte de risque (instantané du tick) ---
@@ -424,6 +462,8 @@ class Orchestrator:
         """Budgets fixes x multiplicateur de régime (§12.1) : peut seulement réduire, jamais dépasser le budget configuré."""
         configs = []
         for unit in self.units.values():
+            if unit.kind == "observer":
+                continue
             if unit.kind == "grid":
                 minimum = min_viable_budget(unit.grid_cfg.intervals, unit.grid_cfg.min_notional)
             elif unit.min_viable is not None:
@@ -435,7 +475,7 @@ class Orchestrator:
         allocations = compute_allocations(configs, regime, self.ledger.total, self.settings.treasury_reserve_pct)
         apply_allocations(self.ledger, allocations)
         for unit in self.units.values():       # budget nul : un agent à exposition cible sort de ses positions
-            if unit.kind in ("exposure", "portfolio"):
+            if unit.kind in ("exposure", "portfolio", "marketmaker", "legacy"):
                 unit.runner.suspended = allocations[unit.agent_id].budget == 0
         detail = ", ".join(f"{aid}={a.budget} ({a.status})" for aid, a in allocations.items())
         self.alerts.send("INFO", f"régime {regime.value} : budgets {detail}")
@@ -460,9 +500,12 @@ class Orchestrator:
     def _forward_runner_alerts(self, agent_id: str, unit: _Unit) -> None:
         drain = getattr(unit.runner, "drain_alerts", None)
         for text in drain() if drain else []:
+            if text.startswith("info : "):
+                self.alerts.send("INFO", f"{agent_id} : {text[len('info : '):]}")
+                continue
             critical = "urgence" in text or "non protégée" in text
             self.alerts.send("CRITICAL" if critical else "WARNING", f"{agent_id} : {text}")
-        if unit.kind in ("exposure", "portfolio") and unit.runner.suspended and not unit.positioned:
+        if unit.kind in ("exposure", "portfolio", "marketmaker", "legacy") and unit.runner.suspended and not unit.positioned:
             free = self.ledger.account(agent_id).available
             if free > 0:
                 self.ledger.deallocate(agent_id, free)      # budget libéré tant que le régime est défavorable
@@ -580,6 +623,10 @@ class Orchestrator:
                 self.store.log_equity(now, f"agent:{agent_id}", float(unit.runner.equity(self._prices[unit.symbol])))
             elif unit.kind == "portfolio":
                 self.store.log_equity(now, f"agent:{agent_id}", float(unit.runner.equity(self._prices)))
+            elif unit.kind == "marketmaker":
+                self.store.log_equity(now, f"agent:{agent_id}", float(unit.runner.equity(self._prices[unit.symbol])))
+            elif unit.kind == "legacy":
+                self.store.log_equity(now, f"agent:{agent_id}", float(unit.runner.equity({s: self._prices[s] for s in unit.symbols})))
 
     def _daily_report(self) -> str:
         day, orders = self._report_due

@@ -11,12 +11,15 @@ from orchestre.runtime.orchestrator import Orchestrator
 from orchestre.strategies.dca import DcaConfig
 from orchestre.strategies.breakout import DonchianBreakout
 from orchestre.strategies.grid import GridConfig
+from orchestre.strategies.legacy import load_legacy_agent
+from orchestre.strategies.triangular import Triangle
 from orchestre.strategies.meanreversion import MeanReversion
 from orchestre.strategies.rotation import ConstantMix, Rotation
 from orchestre.strategies.trend import TrendFollowing
 
-KNOWN = ("dca", "grid", "trend", "breakout", "meanreversion", "rotation", "rebalance")
+KNOWN = ("dca", "grid", "trend", "breakout", "meanreversion", "rotation", "rebalance", "triangular", "marketmaker", "legacy")
 EXPOSURE = ("trend", "breakout", "meanreversion", "rotation", "rebalance")   # stratèges à exposition cible (§14)
+OTHERS = ("triangular", "marketmaker", "legacy")                                # observateur, simulation, agents existants (S-8, S-9)
 
 
 def _field(section: dict, name: str, strategy: str):
@@ -36,6 +39,26 @@ def _dec(section: dict, name: str, strategy: str, default: str | None = None) ->
 def _params(section: dict, names: dict) -> dict:
     """Paramètres facultatifs d'une stratégie, convertis dans leur type."""
     return {name: kind(section[name]) for name, kind in names.items() if name in section}
+
+
+def _add_other_strategy(name: str, section: dict, orch: Orchestrator) -> None:
+    if name == "triangular":
+        tri = Triangle(str(_field(section, "a", name)), str(_field(section, "b", name)), str(section.get("quote", orch.settings.quote_currency)))
+        orch.add_observer("triangular", tri, _dec(section, "notional", name, "100"), _dec(section, "threshold", name, "0.0005"))
+        return
+    if orch.settings.env is Env.LIVE and not section.get("promoted", False):
+        raise ConfigError(f"strategies.{name} : refusée en réel sans `promoted = true` (décision humaine de promotion, cycle de vie §14)")
+    budget = _dec(section, "budget_quote", name)
+    if name == "marketmaker":
+        orch.add_marketmaker(
+            "marketmaker", str(_field(section, "symbol", name)), budget,
+            half_spread=_dec(section, "half_spread", name, "0.003"), quote_size_pct=_dec(section, "quote_size_pct", name, "0.25"),
+            max_inventory_pct=_dec(section, "max_inventory_pct", name, "0.5"),
+        )
+    else:
+        symbols = [str(x) for x in _field(section, "symbols", name)]
+        agent = load_legacy_agent(_field(section, "path", name), str(_field(section, "class", name)))
+        orch.add_legacy("legacy", agent, symbols, budget)
 
 
 def _add_exposure_strategy(name: str, section: dict, orch: Orchestrator) -> None:
@@ -74,6 +97,9 @@ def strategy_symbols(raw: dict) -> set[str]:
     for name, section in raw.get("strategies", {}).items():
         if not isinstance(section, dict) or not section.get("enabled", False):
             continue
+        if name == "triangular" and {"a", "b"} <= set(section):
+            quote = str(section.get("quote", "USDT"))
+            symbols.update(Triangle(str(section["a"]), str(section["b"]), quote).symbols)
         if "symbol" in section:
             symbols.add(str(section["symbol"]))
         symbols.update(str(x) for x in section.get("symbols", []))
@@ -91,9 +117,9 @@ def build_team(raw: dict, orch: Orchestrator, exchange: Exchange, now: datetime)
         section = sections.get(name)
         if not section or not section.get("enabled", False):
             continue
-        if name in EXPOSURE:
+        if name in EXPOSURE or name in OTHERS:
             try:
-                _add_exposure_strategy(name, section, orch)
+                (_add_exposure_strategy if name in EXPOSURE else _add_other_strategy)(name, section, orch)
             except ConfigError:
                 raise
             except (ValueError, TypeError) as exc:

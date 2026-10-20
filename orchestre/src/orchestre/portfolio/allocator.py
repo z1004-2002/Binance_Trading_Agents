@@ -22,6 +22,9 @@ MULTIPLIERS: dict[str, dict[Regime, Decimal]] = {
     "S-5": {_H: Decimal("0"), _R: Decimal("1"), _B: Decimal("0"), _V: Decimal("0")},
     "S-6": {_H: Decimal("1"), _R: Decimal("0.5"), _B: Decimal("0"), _V: Decimal("0.5")},
     "S-7": {_H: Decimal("1"), _R: Decimal("1"), _B: Decimal("1"), _V: Decimal("1")},
+    # S-8 agents existants : budget fixé par le porteur, pas de gouvernance par régime tant que leur comportement n'est pas audité
+    "S-8": {_H: Decimal("1"), _R: Decimal("1"), _B: Decimal("1"), _V: Decimal("1")},
+    "S-9b": {_H: Decimal("0.5"), _R: Decimal("1"), _B: Decimal("0"), _V: Decimal("0")},      # tenue de marché : comme le Grid
 }
 
 SAFETY_MARGIN = Decimal("1.2")

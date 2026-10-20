@@ -218,7 +218,12 @@ class ExecutionService:
         else:
             self._release_up_to(agent, value)
 
+    def _reserved_for_open_buys(self, agent: str) -> Decimal:
+        return sum((t.committed for t in self._tracked.values() if t.agent_id == agent and t.side is Side.BUY), Decimal("0"))
+
     def _release_up_to(self, agent: str, value: Decimal) -> None:
-        released = min(value, self._ledger.account(agent).committed)
+        """Le produit d'une vente libère le coût des positions détenues, JAMAIS le montant réservé par un achat en attente."""
+        free = self._ledger.account(agent).committed - self._reserved_for_open_buys(agent)
+        released = min(value, max(free, Decimal("0")))
         if released > 0:
             self._ledger.release(agent, released)
