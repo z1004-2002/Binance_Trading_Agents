@@ -248,3 +248,13 @@ def test_fallback_report_has_capital_drawdown_agents_and_alerts(tmp_path):
     _, data, _ = seeded(tmp_path)
     text = fallback_report(data)
     assert "Capital" in text and "dca" in text and "Drawdown" in text and KEY not in text
+
+
+def test_a_warning_is_logged_once_when_80_percent_of_the_monthly_budget_is_reached(tmp_path):
+    agent, _, store = assistant(tmp_path, [reply("a", tin=500, tout=300), reply("b", tin=10, tout=10), reply("c", tin=10, tout=10)], budget=1000)
+    agent.ask("q1")                                    # 800 jetons : 80 % exactement
+    warnings = lambda: store.db.conn.execute("select detail from events where kind = 'llm_budget'").fetchall()  # noqa: E731
+    assert len(warnings()) == 1 and "80" in warnings()[0][0]
+    agent.ask("q2")
+    agent.ask("q3")
+    assert len(warnings()) == 1                         # un seul avertissement par mois

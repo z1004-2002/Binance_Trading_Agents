@@ -228,10 +228,24 @@ class Store:
         ).fetchone()
         return int(row[0])
 
+    # --- cycle de vie des stratégies (EX-LC-02) ---
+    def log_lifecycle(self, ts: datetime, code: str, from_stage: str, to_stage: str, reason: str, decided_by: str) -> None:
+        with self.db.transaction() as c:
+            c.execute(
+                "insert into lifecycle_events (ts, agent_code, from_stage, to_stage, reason, decided_by) values (?, ?, ?, ?, ?, ?)",
+                (ts.isoformat(), code, from_stage, to_stage, mask_secrets(reason), decided_by),
+            )
+
+    def lifecycle_events(self, code: str | None = None) -> list[dict]:
+        query, args = "select * from lifecycle_events", ()
+        if code:
+            query, args = query + " where agent_code = ?", (code,)
+        return [dict(r) for r in self.db.conn.execute(query + " order by id desc", args)]
+
     def count(self, table: str) -> int:
         allowed = {
             "messages", "events", "agent_state", "ledger", "tracked_orders", "regimes", "volatility", "sentiment",
-            "equity_snapshots", "order_log", "commands", "proposals", "assistant_queue", "llm_calls",
+            "equity_snapshots", "order_log", "commands", "proposals", "assistant_queue", "llm_calls", "lifecycle_events",
         }
         if table not in allowed:
             raise ValueError("table inconnue")

@@ -22,6 +22,9 @@ from orchestre.assistant.news import default_fetch as news_default_fetch, pairs_
 from orchestre.assistant.tools import ToolBox
 from orchestre.assistant.worker import run_worker
 from orchestre.dashboard.data import DashboardData
+from orchestre.backup import BackupError, make_backup
+from orchestre.lifecycle import CODES, STAGES, LifecycleError, current_stage, history as lifecycle_history, set_stage
+from orchestre.launcher import cmd_down, cmd_ps, cmd_up
 from orchestre.experiment.protocol import ProtocolError, evaluate, load_protocol, start_experiment, verify_experiment
 from orchestre.audit.legacy import SEVERITIES, render_markdown, scan
 from orchestre.dashboard.server import DashboardServer
@@ -381,6 +384,37 @@ def _cmd_experiment(args, out, err) -> int:
         return 2
 
 
+def _cmd_backup(args, out, err) -> int:
+    try:
+        path = make_backup(args.db, args.dest, args.keep, SystemClock().now())
+    except BackupError as exc:
+        print(f"Erreur : {exc}", file=err)
+        return 2
+    print(f"Sauvegarde cohérente créée : {path} ({args.keep} conservées). Pense à la copier HORS du serveur (ENF-05).", file=out)
+    return 0
+
+
+def _cmd_lifecycle(args, out, err) -> int:
+    if not Path(args.db).exists():
+        print(f"Erreur : base introuvable : {args.db}", file=err)
+        return 2
+    store = Store(Database(args.db))
+    if args.lifecycle_command == "show":
+        for code in CODES:
+            events = lifecycle_history(store, code)
+            last = f" (depuis {events[0]['ts'][:10]} : {events[0]['reason']})" if events else " (étape par défaut : aucune stratégie n'a passé la simulation)"
+            print(f"{code}  {current_stage(store, code):<12}{last}", file=out)
+        return 0
+    try:
+        set_stage(store, args.code, args.stage, args.reason, args.by, SystemClock().now(),
+                  confirm=args.confirm, decision_exists=Path(args.decision_file).exists())
+    except LifecycleError as exc:
+        print(f"Erreur : {exc}", file=err)
+        return 2
+    print(f"{args.code} : {args.stage} (enregistré avec sa raison).", file=out)
+    return 0
+
+
 def _cmd_kill(args, out) -> int:
     stop = Path(args.stop_file)
     stop.parent.mkdir(parents=True, exist_ok=True)
@@ -475,6 +509,42 @@ def build_parser() -> argparse.ArgumentParser:
     nw.add_argument("--env-file", default=".env")
     nw.add_argument("--rss", action="append", required=True, help="URL d'un flux RSS ou Atom (répétable)")
     nw.add_argument("--assets", default="BTC,ETH,SOL,BNB,XRP")
+    up = sub.add_parser("up", help="lance tout le système : moteur + tableau de bord + assistant")
+    up.add_argument("--mode", default="paper", help="paper (défaut) ou testnet ; jamais le réel")
+    up.add_argument("--config", default="config/settings.toml")
+    up.add_argument("--db", default=None, help="défaut : var/paper.db ou var/testnet.db")
+    up.add_argument("--stop-file", default="var/STOP")
+    up.add_argument("--port", type=int, default=8765)
+    up.add_argument("--interval", type=float, default=30.0)
+    up.add_argument("--env-file", default=".env")
+    up.add_argument("--paper-cash", type=float, default=None)
+    up.add_argument("--no-dashboard", action="store_true")
+    up.add_argument("--no-assistant", action="store_true")
+    up.add_argument("--no-analysis", action="store_true")
+    up.add_argument("--detach", action="store_true", help="lance en arrière-plan")
+    up.add_argument("--check", action="store_true", help="affiche le plan et s'arrête")
+    up.add_argument("--ticks", type=int, default=None, help=argparse.SUPPRESS)
+    for name in ("down", "ps"):
+        sp = sub.add_parser(name)
+        sp.add_argument("--run-dir", default="var/run")
+        if name == "down":
+            sp.add_argument("--timeout", type=float, default=30.0)
+    bk = sub.add_parser("backup")
+    bk.add_argument("--db", default="var/orchestre.db")
+    bk.add_argument("--dest", default="backups")
+    bk.add_argument("--keep", type=int, default=14)
+    lc = sub.add_parser("lifecycle")
+    lc_sub = lc.add_subparsers(dest="lifecycle_command", required=True)
+    lc_show = lc_sub.add_parser("show")
+    lc_set = lc_sub.add_parser("set")
+    lc_set.add_argument("code", choices=CODES)
+    lc_set.add_argument("stage")
+    lc_set.add_argument("--reason", required=True)
+    lc_set.add_argument("--by", default="porteur")
+    lc_set.add_argument("--confirm", action="store_true")
+    lc_set.add_argument("--decision-file", default="docs/decision-live.md")
+    for sp in (lc_show, lc_set):
+        sp.add_argument("--db", default="var/orchestre.db")
     ex = sub.add_parser("experiment")
     ex_sub = ex.add_subparsers(dest="experiment_command", required=True)
     for name in ("start", "status"):
@@ -525,6 +595,16 @@ def main(
         }
         if args.command in backtests:
             return backtests[args.command](args, out, err, public_client_factory or create_public_client)
+        if args.command == "backup":
+            return _cmd_backup(args, out, err)
+        if args.command == "lifecycle":
+            return _cmd_lifecycle(args, out, err)
+        if args.command == "up":
+            return cmd_up(args, out, err)
+        if args.command == "down":
+            return cmd_down(args, out, err)
+        if args.command == "ps":
+            return cmd_ps(args, out, err)
         if args.command == "experiment":
             return _cmd_experiment(args, out, err)
         if args.command == "assistant":

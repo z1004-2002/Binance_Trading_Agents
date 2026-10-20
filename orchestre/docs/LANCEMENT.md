@@ -208,3 +208,42 @@ est indisponible, l'assistant s'arrête : l'équipe n'en dépend pas, et le rapp
 **Audit de l'existant (phase 0).** `./orchestre.sh audit-legacy --path <dossier> --output docs/audit-existant.md` cherche clés en clair, ordres directs, retraits,
 absence de tests ou de stops, sans jamais recopier un secret. Le rapport actuel (`docs/audit-existant.md`) porte sur un unique script : le code du système
 multi-agents n'est pas sur cette machine.
+
+
+## 11. Tout lancer d'une commande, expérience, cycle de vie, sauvegarde
+
+**Lancer tout le système** (moteur + tableau de bord + assistant selon `.env`) :
+
+```bash
+./start.sh                       # simulation (paper) sur le marché réel, aucune clé Binance nécessaire
+./start.sh paper --detach        # idem, en arrière-plan
+./start.sh testnet               # ordres sur le testnet (clés testnet requises dans .env)
+./orchestre.sh ps                # état de chaque composant (pid, relances, adresse du tableau de bord)
+./stop.sh                        # arrêt propre de tout (SIGINT, puis SIGTERM, puis SIGKILL si besoin)
+./orchestre.sh up --check        # affiche ce qui serait lancé et ce qui est ignoré, sans rien démarrer
+```
+
+Journaux : `var/logs/moteur.log`, `tableau-de-bord.log`, `assistant.log`. Un composant qui plante est relancé avec un délai croissant (5 relances par 10 minutes au plus) ;
+une sortie normale (par exemple après un arrêt d'urgence) n'est pas relancée. Le tableau de bord et l'assistant ne reçoivent que leur propre environnement : jamais les clés d'exchange.
+**Le mode réel n'est jamais lancé par ces commandes** (il passe par `run --live` et la porte du §20).
+
+**Protocole d'expérience** (à figer AVANT de commencer ; relire d'abord les seuils de `config/experiments/e1-paper.toml`, question ouverte Q-9) :
+
+```bash
+./orchestre.sh experiment start  --protocol config/experiments/e1-paper.toml --db var/paper.db
+./orchestre.sh experiment status --protocol config/experiments/e1-paper.toml --db var/paper.db   # critères OK / NON / TROP TÔT, règles d'arrêt
+```
+
+Modifier le fichier après `start` invalide l'expérience (empreinte SHA-256). Le verdict est indicatif et ne remplace jamais ta décision de passage au réel.
+
+**Cycle de vie des stratégies** (toutes sont à l'étape BACKTEST : aucune n'a passé 30 jours de simulation) :
+
+```bash
+./orchestre.sh lifecycle show --db var/paper.db
+./orchestre.sh lifecycle set S-3 PAPER --reason "essai en simulation" --db var/paper.db
+```
+
+Une promotion avance d'une étape à la fois ; entrer en LIVE_PILOTE ou LIVE exige `--confirm` et la décision écrite `docs/decision-live.md`. Une rétrogradation est libre.
+
+**Sauvegarde** de la base (copie cohérente même pendant que le système tourne) : `./orchestre.sh backup --db var/paper.db --dest backups --keep 14`. Copie-la hors de la machine.
+Les modèles de services système et de sauvegarde automatique sont dans `deploy/` (non testés sur un vrai serveur).

@@ -206,7 +206,7 @@ def settings_file(tmp_path, env="testnet", strategies=True):
     body = f'env = "{env}"\nmax_total_capital_quote = "500"\n'
     if strategies:
         body += '[strategies.dca]\nenabled = true\nsymbol = "BTCUSDT"\namount_quote = "20"\ninterval_days = 7\ncumulative_cap = "100"\n'
-    f = tmp_path / "s.toml"
+    f = tmp_path / f"s-{env}-{int(strategies)}.toml"
     f.write_text(body)
     return f
 

@@ -1,0 +1,29 @@
+# MODÈLE de service systemd (NON TESTÉ sur un vrai serveur : à relire et adapter avant usage).
+# Installation : sudo cp deploy/orchestre.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now orchestre
+# Hypothèses : projet dans /opt/orchestre/orchestre, utilisateur dédié « orchestre » SANS droits d'administration, Python dans /opt/orchestre/bin-env.
+[Unit]
+Description=ORCHESTRE - équipe d'agents de trading (moteur + tableau de bord + assistant)
+After=network-online.target time-sync.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orchestre
+WorkingDirectory=/opt/orchestre/orchestre
+# Simulation sur marché réel. Pour le testnet : remplacer `paper` par `testnet`. Le mode réel ne se lance jamais depuis ce service.
+ExecStart=/opt/orchestre/orchestre/start.sh paper --config config/settings.toml
+# L'arrêt propre du système passe par SIGINT (le moteur termine son tick et sauvegarde ; les stops de protection restent chez Binance).
+KillSignal=SIGINT
+TimeoutStopSec=60
+Restart=on-failure
+RestartSec=10
+# Durcissement
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/orchestre/orchestre/var /opt/orchestre/orchestre/data /opt/orchestre/orchestre/backups
+# Les clés ne sont lues que depuis /opt/orchestre/orchestre/.env (droits 600, propriétaire orchestre), jamais depuis ce fichier.
+
+[Install]
+WantedBy=multi-user.target

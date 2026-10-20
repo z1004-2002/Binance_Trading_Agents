@@ -506,3 +506,36 @@ def test_news_with_no_title_does_not_call_the_llm(tmp_path):
     db, _ = assistant_db(tmp_path)
     code, out, _, calls = run_assistant(["news", "--db", str(db), "--rss", "https://x/rss"], GROQ_ENV, [], news=lambda url: "pas du xml")
     assert code == 0 and calls == [] and "aucun titre" in out.lower()
+
+
+# --- up / down / ps : lanceur global ---
+
+def up_cfg(tmp_path, env="testnet"):
+    return write_cfg(tmp_path, f'env = "{env}"\nmax_total_capital_quote = "500"\n[strategies.dca]\nenabled = true\nsymbol = "BTCUSDT"\n'
+                              'amount_quote = "20"\ninterval_days = 7\ncumulative_cap = "100"\n')
+
+
+def test_up_check_shows_the_plan_and_what_is_skipped(tmp_path):
+    envf = tmp_path / ".env"
+    envf.write_text("DASHBOARD_PASSWORD=mot-de-passe-solide\n")
+    code, out, _ = run(["up", "--check", "--config", up_cfg(tmp_path), "--env-file", str(envf), "--port", "0"])
+    assert code == 0 and "moteur" in out and "assistant non démarré" in out
+
+
+def test_up_never_launches_real_money_nor_unknown_modes(tmp_path):
+    code, _, err = run(["up", "--check", "--config", up_cfg(tmp_path, env="live")])
+    assert code == 2 and "réel" in err
+    code, _, err = run(["up", "--check", "--config", up_cfg(tmp_path), "--mode", "live"])
+    assert code == 2 and "paper ou testnet" in err
+
+
+def test_up_testnet_mode_names_the_missing_keys(tmp_path):
+    code, _, err = run(["up", "--check", "--mode", "testnet", "--config", up_cfg(tmp_path), "--env-file", str(tmp_path / "vide")])
+    assert code == 2 and "BINANCE_TESTNET_API_KEY" in err
+
+
+def test_down_and_ps_with_nothing_running(tmp_path):
+    code, out, _ = run(["down", "--run-dir", str(tmp_path / "run")])
+    assert code == 0 and "Aucun système" in out
+    code, out, _ = run(["ps", "--run-dir", str(tmp_path / "run")])
+    assert code == 0 and "Aucun état" in out

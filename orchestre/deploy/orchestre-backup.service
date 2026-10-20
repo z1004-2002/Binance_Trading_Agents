@@ -1,0 +1,11 @@
+# MODÈLE (NON TESTÉ) : sauvegarde cohérente de la base. Déclenchée chaque jour par orchestre-backup.timer.
+[Unit]
+Description=ORCHESTRE - sauvegarde de la base
+
+[Service]
+Type=oneshot
+User=orchestre
+WorkingDirectory=/opt/orchestre/orchestre
+ExecStart=/opt/orchestre/orchestre/orchestre.sh backup --db var/paper.db --dest backups --keep 14
+# Copie HORS du serveur (ENF-05) : adapter l'hôte distant, la clé SSH et le chemin, puis décommenter.
+# ExecStartPost=/usr/bin/rsync -a --delete /opt/orchestre/orchestre/backups/ sauvegarde@mon-autre-machine:/chemin/orchestre-backups/

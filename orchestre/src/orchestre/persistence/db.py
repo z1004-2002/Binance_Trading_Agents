@@ -134,6 +134,17 @@ MIGRATIONS: list[str] = [
         error text
     );
     """,
+    """
+    create table lifecycle_events (
+        id integer primary key autoincrement,
+        ts text not null,
+        agent_code text not null,
+        from_stage text not null,
+        to_stage text not null,
+        reason text not null,
+        decided_by text not null
+    );
+    """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 

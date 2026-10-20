@@ -62,7 +62,20 @@ class AssistantAgent:
             raise
         self.store.log_llm_call(self._clock(), self._model, purpose, result.tokens_in, result.tokens_out,
                                 int((self._mono() - started) * 1000), None)
+        self._warn_if_budget_is_nearly_spent()
         return result
+
+    def _warn_if_budget_is_nearly_spent(self) -> None:
+        """EX-LLM-08 : un avertissement (une seule fois par mois) à 80 % du budget, avant la coupure."""
+        now = self._clock()
+        used = self.store.llm_tokens_for_month(now)
+        month = f"{now.year:04d}-{now.month:02d}"
+        already = self.store.db.conn.execute(
+            "select count(*) from events where kind = 'llm_budget' and substr(ts, 1, 7) = ?", (month,)
+        ).fetchone()[0]
+        if used >= 0.8 * self._budget and not already:
+            self.store.log_event(now, "WARNING", "llm_budget",
+                                 f"assistant : {used} jetons utilisés sur {self._budget} ce mois-ci (80 % atteints)")
 
     def ask(self, question: str, purpose: str = "ask") -> str:
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": question}]
