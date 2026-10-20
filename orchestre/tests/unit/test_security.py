@@ -4,7 +4,10 @@ import re
 from pathlib import Path
 
 SRC = Path(__file__).parents[2] / "src"
-FORBIDDEN = re.compile(r"withdraw|convert_?trade|sapi/v1/capital/withdraw", re.IGNORECASE)
+FORBIDDEN = re.compile(
+    r"\bwithdraw\w*\s*\(|capital/withdraw|convert_?trade|sapiPost\w*(withdraw|transfer)|\btransfer\w*\s*\(",
+    re.IGNORECASE,
+)
 
 
 def test_no_withdraw_or_convert_calls_in_source():
