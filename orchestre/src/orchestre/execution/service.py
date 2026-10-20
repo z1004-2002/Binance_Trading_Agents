@@ -75,6 +75,24 @@ class ExecutionService:
             return self._settle(approved, known, f"statut récupéré après {exc!r}")
         return self._settle(approved, result, "ordre envoyé")
 
+    # --- persistance (A-7) ---
+    def export_tracked(self) -> list[dict]:
+        return [
+            {
+                "symbol": s, "client_order_id": cid, "agent_id": t.agent_id,
+                "side": t.side.value, "committed": str(t.committed),
+            }
+            for (s, cid), t in sorted(self._tracked.items())
+        ]
+
+    def import_tracked(self, rows: list[dict]) -> None:
+        self._tracked = {
+            (r["symbol"], r["client_order_id"]): _Tracked(
+                r["agent_id"], Side(r["side"]), Decimal(r["committed"])
+            )
+            for r in rows
+        }
+
     # --- suivi des ordres en attente ---
     def open_order_ids(self, symbol: str) -> list[str]:
         return sorted(cid for (s, cid) in self._tracked if s == symbol)

@@ -48,6 +48,37 @@ class GridRunner:
         self.rejections: list[RiskDecision] = []
         self.halted = False
 
+    def export_state(self) -> dict:
+        return {
+            "live": [
+                {
+                    "level": o.level, "side": o.side.value, "price": str(o.price),
+                    "quantity": str(o.quantity), "client_order_id": o.client_order_id,
+                    "reason": o.reason,
+                }
+                for o in self._live.values()
+            ],
+            "open_buys": {str(k): [str(p), str(q)] for k, (p, q) in self._open_buys.items()},
+            "cycles": self.cycles_completed,
+            "profit": str(self.realized_profit),
+            "halted": self.halted,
+        }
+
+    def import_state(self, state: dict) -> None:
+        self._live = {
+            o["client_order_id"]: GridOrder(
+                o["level"], Side(o["side"]), Decimal(o["price"]), Decimal(o["quantity"]),
+                o["client_order_id"], o["reason"],
+            )
+            for o in state["live"]
+        }
+        self._open_buys = {
+            int(k): (Decimal(p), Decimal(q)) for k, (p, q) in state["open_buys"].items()
+        }
+        self.cycles_completed = state["cycles"]
+        self.realized_profit = Decimal(state["profit"])
+        self.halted = state["halted"]
+
     def start(self, price: Decimal) -> None:
         for order in initial_orders(self._cfg, price):
             self._submit(order)

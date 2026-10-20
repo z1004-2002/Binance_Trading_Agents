@@ -34,6 +34,24 @@ class Ledger:
         self._total = total_capital_quote
         self._accounts: dict[str, Account] = {}
 
+    def snapshot(self) -> dict:
+        return {
+            "total": str(self._total),
+            "accounts": {
+                a.agent_id: {"allocated": str(a.allocated), "committed": str(a.committed)}
+                for a in self._accounts.values()
+            },
+        }
+
+    @classmethod
+    def from_snapshot(cls, snap: dict) -> "Ledger":
+        ledger = cls(Decimal(snap["total"]))
+        for aid, acc in snap["accounts"].items():
+            ledger._accounts[aid] = Account(aid, Decimal(acc["allocated"]), Decimal(acc["committed"]))
+        if ledger.unallocated < 0:
+            raise LedgerError("snapshot incohérent : allocations supérieures au total")
+        return ledger
+
     @property
     def total(self) -> Decimal:
         return self._total
