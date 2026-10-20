@@ -101,3 +101,28 @@ def test_executor_cancel_all_leaves_zero_orphans_and_clean_reconcile(ex):
     svc.cancel_all_open(SYMBOL)
     assert ex.get_open_orders(SYMBOL) == []
     assert svc.reconcile(SYMBOL) == []
+
+
+def test_protective_stop_limit_order_lifecycle(ex):
+    """EX-SEC-14 : vérifie que le connecteur pose bien un STOP_LOSS_LIMIT de vente chez Binance (paramètres ccxt).
+
+    Nécessite un solde libre en BTC sur le testnet ; sinon le test est ignoré.
+    """
+    f = ex.get_filters(SYMBOL)
+    price = ex.get_price(SYMBOL)
+    qty = (f.min_notional * 3 / price / f.step_size).to_integral_value(rounding=ROUND_CEILING) * f.step_size
+    if ex.get_balances().get("BTC", D("0")) < qty:
+        pytest.skip("pas assez de BTC libre sur le testnet pour poser un stop de vente")
+    stop = round_price(price * D("0.9"), Side.BUY, f)
+    limit = round_price(stop * D("0.995"), Side.BUY, f)
+    req = OrderRequest(SYMBOL, Side.SELL, qty, limit, new_id(), stop)
+    try:
+        placed = ex.place_order(req)
+        assert placed.status == "NEW", placed
+        assert ex.get_order(SYMBOL, req.client_order_id).status == "NEW"
+        assert req.client_order_id in [o.client_order_id for o in ex.get_open_orders(SYMBOL)]
+    finally:
+        leftover = ex.get_order(SYMBOL, req.client_order_id)
+        if leftover is not None and leftover.status == "NEW":
+            ex.cancel_order(SYMBOL, req.client_order_id)
+    assert ex.get_order(SYMBOL, req.client_order_id).status == "CANCELED"

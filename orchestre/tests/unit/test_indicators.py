@@ -80,3 +80,29 @@ def test_percentile_interpolates():
     assert percentile([1, 2, 3, 4, 5], 0.5) == 3
     assert percentile([1, 2, 3, 4, 5], 0.9) == pytest.approx(4.6)
     assert percentile([7], 0.9) == 7
+
+
+from orchestre.analysis.indicators import bollinger, rsi  # noqa: E402
+
+
+def test_rsi_extremes_and_flat():
+    assert rsi([100 + i for i in range(30)], 14) == 100.0
+    assert rsi([100 - i for i in range(30)], 14) == 0.0
+    assert rsi([100.0] * 30, 14) == 50.0
+
+
+def test_rsi_is_close_to_50_for_symmetric_moves_and_below_after_a_sharp_drop():
+    zigzag = [100 + (1 if i % 2 else 0) for i in range(60)]
+    assert 40 < rsi(zigzag, 14) < 60
+    assert rsi([*zigzag, 85.0], 14) < 30
+
+
+def test_rsi_needs_enough_history():
+    with pytest.raises(ValueError):
+        rsi([1, 2, 3], 14)
+
+
+def test_bollinger_bands():
+    lower, mid, upper = bollinger([1, 2, 3, 4, 5], 5, 2.0)
+    assert mid == 3 and upper == pytest.approx(3 + 2 * math.sqrt(2)) and lower == pytest.approx(3 - 2 * math.sqrt(2))
+    assert bollinger([7.0] * 20, 20) == (7.0, 7.0, 7.0)

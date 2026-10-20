@@ -37,8 +37,9 @@ class OrderRequest:
     symbol: str
     side: Side
     quantity: Decimal
-    price: Decimal | None  # None = ordre au marché
+    price: Decimal | None  # None = ordre au marché ; avec stop_price : prix limite de l'ordre stop
     client_order_id: str
+    stop_price: Decimal | None = None  # prix de déclenchement d'un ordre STOP_LOSS_LIMIT (vente)
 
 
 @dataclass(frozen=True)
@@ -71,7 +72,7 @@ class Exchange(ABC):
     def get_open_orders(self, symbol: str) -> list[OrderResult]: ...
 
     @abstractmethod
-    def get_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]: ...
+    def get_candles(self, symbol: str, interval: str, limit: int, end_time: datetime | None = None) -> list[Candle]: ...
 
     @abstractmethod
     def get_order_book(self, symbol: str, depth: int = 100) -> OrderBook: ...

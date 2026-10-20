@@ -19,7 +19,7 @@ def total_return(equity: Sequence[float]) -> float:
     return equity[-1] / equity[0] - 1
 
 
-def annualized_return(equity: Sequence[float], days: int) -> float:
+def annualized_return(equity: Sequence[float], days: float) -> float:
     _need(equity, 2)
     return (equity[-1] / equity[0]) ** (PERIODS / days) - 1
 
@@ -38,27 +38,27 @@ def max_drawdown(equity: Sequence[float]) -> float:
     return worst
 
 
-def sharpe(equity: Sequence[float], rf_annual: float = 0.0) -> float:
+def sharpe(equity: Sequence[float], rf_annual: float = 0.0, periods: int = PERIODS) -> float:
     """Moyenne des rendements en excès / écart-type, annualisé [23]. 0 si la série est constante."""
     _need(equity, 3)
-    excess = [r - rf_annual / PERIODS for r in daily_returns(equity)]
+    excess = [r - rf_annual / periods for r in daily_returns(equity)]
     spread = statistics.stdev(excess)
-    return 0.0 if spread == 0 else statistics.mean(excess) / spread * math.sqrt(PERIODS)
+    return 0.0 if spread == 0 else statistics.mean(excess) / spread * math.sqrt(periods)
 
 
-def sortino(equity: Sequence[float], target_annual: float = 0.0) -> float:
+def sortino(equity: Sequence[float], target_annual: float = 0.0, periods: int = PERIODS) -> float:
     """Même numérateur ÷ écart aux rendements sous la cible [24]. Infini s'il n'y a aucune perte et un gain."""
     _need(equity, 3)
-    target = target_annual / PERIODS
+    target = target_annual / periods
     excess = [r - target for r in daily_returns(equity)]
     downside = math.sqrt(sum(min(x, 0.0) ** 2 for x in excess) / len(excess))
     mean = statistics.mean(excess)
     if downside == 0:
         return math.inf if mean > 0 else 0.0
-    return mean / downside * math.sqrt(PERIODS)
+    return mean / downside * math.sqrt(periods)
 
 
-def calmar(equity: Sequence[float], days: int) -> float:
+def calmar(equity: Sequence[float], days: float) -> float:
     drawdown = max_drawdown(equity)
     annual = annualized_return(equity, days)
     if drawdown == 0:

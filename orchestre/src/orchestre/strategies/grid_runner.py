@@ -93,14 +93,14 @@ class GridRunner:
             return
         if range_status(self._cfg, price) == "BELOW_STOP" and self._exit_policy != "wait":
             self.halted = True
-            for report in self._svc.sync(self._cfg.symbol):  # enregistrer d'abord ce qui a été exécuté
+            for report in self._svc.sync(self._cfg.symbol, self._cfg.agent_id):  # enregistrer d'abord ce qui a été exécuté
                 self._on_filled(report.result, reinvest=False)
-            self._svc.cancel_all_open(self._cfg.symbol)
+            self._svc.cancel_all_open(self._cfg.symbol, self._cfg.agent_id)
             self._live.clear()
             if self._exit_policy == "close":
                 self._liquidate(price)
             return
-        for report in self._svc.sync(self._cfg.symbol):
+        for report in self._svc.sync(self._cfg.symbol, self._cfg.agent_id):
             self._on_filled(report.result)
 
     def _liquidate(self, price: Decimal) -> None:

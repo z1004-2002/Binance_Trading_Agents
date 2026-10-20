@@ -72,6 +72,9 @@ MIGRATIONS: list[str] = [
         classification text not null
     );
     """,
+    """
+    alter table tracked_orders add column protective integer not null default 0;
+    """,
 ]
 SCHEMA_VERSION = len(MIGRATIONS)
 

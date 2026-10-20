@@ -20,3 +20,36 @@ intervals = 20
 budget_quote = "200"
 fee_rate = "0.001"
 exit_policy = "pause"                 # "pause" | "wait" | "close"
+
+
+# --- Stratèges à exposition cible (phase 5) : DÉSACTIVÉS par défaut. Chaque position est protégée par un stop posé chez Binance.
+# Aucun n'est validé (voir les backtests) : à n'essayer qu'en simulation (`run --paper`) ou sur testnet.
+# En mode réel, chacun exige en plus `promoted = true` (ta décision écrite de promotion).
+
+[strategies.trend]             # S-3 suivi de tendance, bougies journalières
+enabled = false
+symbol = "BTCUSDT"
+budget_quote = "100"
+
+[strategies.breakout]          # S-4 cassure de canal, bougies journalières
+enabled = false
+symbol = "BTCUSDT"
+budget_quote = "100"
+
+[strategies.meanreversion]     # S-5 retour à la moyenne, bougies de 4 h
+enabled = false
+symbol = "BTCUSDT"
+budget_quote = "100"
+
+[strategies.rotation]          # S-6 rotation momentum ; stop de protection par défaut 25 % (non backtesté)
+enabled = false
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"]
+budget_quote = "150"
+top_k = 3
+
+[strategies.rebalance]         # S-7 rééquilibrage à poids constants (reste en devise de cotation)
+enabled = false
+budget_quote = "100"
+band = "0.05"
+[strategies.rebalance.weights]
+BTCUSDT = "0.5"

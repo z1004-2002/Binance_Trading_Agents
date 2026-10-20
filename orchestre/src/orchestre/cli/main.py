@@ -7,6 +7,7 @@ Codes de sortie : 0 ok, 2 configuration/clés invalides, 3 clé live dangereuse,
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import asyncio
 import os
 import sys
@@ -15,13 +16,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Callable, MutableMapping, TextIO
 
+from orchestre.cli.backtest_cmds import (
+    DEFAULT_UNIVERSE, WALKFORWARD, cmd_backtest, cmd_portfolio_backtest, cmd_team_backtest, cmd_walkforward,
+)
 from orchestre.analysis.sentiment import ATTRIBUTION, default_fetch, sentiment_multiplier
 from orchestre.analysis.service import AnalysisService
 from orchestre.analysis.volatility import vol_target_factor
 from orchestre.config import ConfigError, Env, Settings, load_settings
 from orchestre.core.clock import SystemClock
 from orchestre.core.secrets import mask_secrets
-from orchestre.exchange.binance import BinanceExchange, create_client
+from orchestre.exchange.paper import PaperExchange
+from orchestre.exchange.binance import BinanceExchange, create_client, create_public_client
 from orchestre.exchange.credentials import load_credentials
 from orchestre.exchange.key_restrictions import check_key_restrictions
 from orchestre.execution.service import ExecutionService
@@ -29,7 +34,7 @@ from orchestre.persistence.db import Database
 from orchestre.persistence.store import Store
 from orchestre.portfolio.ledger import Ledger
 from orchestre.runtime.alerts import Alerts
-from orchestre.runtime.builder import build_team
+from orchestre.runtime.builder import build_team, strategy_symbols
 from orchestre.runtime.orchestrator import Orchestrator
 
 SYMBOL = "BTCUSDT"
@@ -100,18 +105,41 @@ def _live_gate(args, exchange: BinanceExchange, settings: Settings, err) -> int 
     return 3 if violations else None
 
 
+def _paper_exchange(args, settings: Settings, raw: dict) -> PaperExchange:
+    """Données de marché réelles (sans clé), ordres et soldes simulés (L0, EX-BT-07)."""
+    symbols = sorted(strategy_symbols(raw))
+    if not symbols:
+        raise ConfigError("aucune stratégie activée (strategies.<nom>.enabled = true)")
+    market = BinanceExchange(args.public_client_factory(), quote=settings.quote_currency)
+    cash = Decimal(str(args.paper_cash)) if args.paper_cash is not None else settings.max_total_capital_quote
+    return PaperExchange(market, symbols, {settings.quote_currency: cash}, quote=settings.quote_currency)
+
+
 def _cmd_run(args, settings: Settings, environ, out, err, factory) -> int:
-    key, secret = load_credentials(settings.env, environ)
-    client = factory(settings.env, key, secret, live_confirmed=settings.env is Env.LIVE)
-    exchange = BinanceExchange(client, quote=settings.quote_currency)
-    refused = _live_gate(args, exchange, settings, err)
-    if refused is not None:
-        return refused
+    with open(args.config, "rb") as fh:
+        raw = tomllib.load(fh)
+    if args.paper:
+        if args.live:
+            raise ConfigError("--paper et --live sont incompatibles")
+        exchange = _paper_exchange(args, settings, raw)
+        settings = replace(settings, dry_run=False)        # paper : les ordres sont exécutés... dans la simulation
+        print("MODE PAPER : données de marché réelles, ordres et soldes SIMULÉS (aucun ordre n'atteint Binance).", file=out)
+    else:
+        key, secret = load_credentials(settings.env, environ)
+        client = factory(settings.env, key, secret, live_confirmed=settings.env is Env.LIVE)
+        exchange = BinanceExchange(client, quote=settings.quote_currency)
+        refused = _live_gate(args, exchange, settings, err)
+        if refused is not None:
+            return refused
+        exchange.sync_time()
     print(_banner(settings), file=out)
-    exchange.sync_time()
 
     Path(args.db).parent.mkdir(parents=True, exist_ok=True)
     store = Store(Database(args.db))
+    mode = "paper" if args.paper else "exchange"
+    previous = store.load_state("run_mode")
+    if previous is not None and previous["mode"] != mode:
+        raise ConfigError(f"cette base a été utilisée en mode '{previous['mode']}', pas '{mode}' : utiliser un autre fichier --db")
     ledger = store.load_ledger()
     if ledger is None:
         ledger = Ledger(settings.max_total_capital_quote)
@@ -127,8 +155,7 @@ def _cmd_run(args, settings: Settings, environ, out, err, factory) -> int:
         orch = Orchestrator(
             settings, exchange, ledger, store, clock, Path(args.stop_file), alerts=alerts, analysis=analysis
         )
-        with open(args.config, "rb") as fh:
-            added = build_team(tomllib.load(fh), orch, exchange, clock.now())
+        added = build_team(raw, orch, exchange, clock.now())
     except ValueError as exc:
         if isinstance(exc, ConfigError):
             raise
@@ -136,6 +163,7 @@ def _cmd_run(args, settings: Settings, environ, out, err, factory) -> int:
     if not added:
         raise ConfigError("aucune stratégie activée (strategies.<nom>.enabled = true)")
     orch.restore()
+    orch.run_mode = mode
     print(f"Équipe : {', '.join(added)}. Un tick toutes les {args.interval} s (Ctrl+C pour arrêter).", file=out)
     try:
         ticks = asyncio.run(orch.run(args.interval, args.ticks))
@@ -186,7 +214,7 @@ def _cmd_cancel_all(args, settings: Settings, environ, out, err, factory) -> int
     client = factory(settings.env, key, secret, live_confirmed=settings.env is Env.LIVE)
     exchange = BinanceExchange(client, quote=settings.quote_currency)
     service = ExecutionService(exchange, Ledger(Decimal("0")), dry_run=False)
-    reports = service.cancel_all_open(args.symbol)
+    reports = service.cancel_all_open(args.symbol, keep_protective=False)
     print(f"{len(reports)} ordre(s) annulé(s) sur {args.symbol}.", file=out)
     return 0
 
@@ -231,8 +259,39 @@ def build_parser() -> argparse.ArgumentParser:
             s.add_argument("--ticks", type=int, default=None, help="nombre de ticks puis arrêt (défaut : sans limite)")
             s.add_argument("--interval", type=float, default=30.0, help="secondes entre deux ticks")
             s.add_argument("--no-analysis", action="store_true", help="désactive les agents d'analyse")
+            s.add_argument("--paper", action="store_true", help="simulation : marché réel en lecture, ordres simulés")
+            s.add_argument("--paper-cash", type=float, default=None, help="capital de départ simulé (défaut : plafond)")
         if name in ("cancel-all", "analyze"):
             s.add_argument("--symbol", default=SYMBOL)
+    def market_args(p):
+        p.add_argument("--cash", type=float, default=1000.0)
+        p.add_argument("--fee", type=float, default=0.001)
+        p.add_argument("--slippage", type=float, default=0.0005)
+        p.add_argument("--data-dir", default="data")
+        p.add_argument("--warmup", type=int, default=None, help="bougies de préchauffage (défaut : 120 en 1d, 200 en 4h)")
+
+    bt = sub.add_parser("backtest")
+    bt.add_argument("--symbol", default=SYMBOL)
+    bt.add_argument("--interval", choices=["1d", "4h"], default="1d")
+    bt.add_argument("--days", type=int, default=1000, help="jours d'historique")
+    market_args(bt)
+    wf = sub.add_parser("walkforward")
+    wf.add_argument("--strategy", choices=sorted(WALKFORWARD), default="trend")
+    wf.add_argument("--symbol", default=SYMBOL)
+    wf.add_argument("--interval", choices=["1d", "4h"], default="1d")
+    wf.add_argument("--days", type=int, default=1000)
+    wf.add_argument("--train", type=int, default=365, help="jours d'entraînement par fenêtre")
+    wf.add_argument("--test", type=int, default=90, help="jours de test (et pas de glissement)")
+    market_args(wf)
+    pb = sub.add_parser("portfolio-backtest")
+    pb.add_argument("--symbols", default=DEFAULT_UNIVERSE)
+    pb.add_argument("--days", type=int, default=1000)
+    pb.add_argument("--null-runs", type=int, default=0, help="nombre de rotations aléatoires pour le modèle nul")
+    market_args(pb)
+    tb = sub.add_parser("team-backtest")
+    tb.add_argument("--symbols", default=DEFAULT_UNIVERSE)
+    tb.add_argument("--days", type=int, default=1000)
+    market_args(tb)
     k = sub.add_parser("kill")
     k.add_argument("--stop-file", default="var/STOP")
     st = sub.add_parser("status")
@@ -247,16 +306,24 @@ def main(
     err: TextIO | None = None,
     client_factory: Callable | None = None,
     fetch_fng: Callable | None = None,
+    public_client_factory: Callable | None = None,
 ) -> int:
     out, err = out or sys.stdout, err or sys.stderr
     environ = environ if environ is not None else dict(os.environ)
     factory = client_factory or create_client
     args = build_parser().parse_args(argv)
     args.fetch_fng = fetch_fng or default_fetch
+    args.public_client_factory = public_client_factory or create_public_client
 
     try:
         if args.command == "kill":
             return _cmd_kill(args, out)
+        backtests = {
+            "backtest": cmd_backtest, "walkforward": cmd_walkforward,
+            "portfolio-backtest": cmd_portfolio_backtest, "team-backtest": cmd_team_backtest,
+        }
+        if args.command in backtests:
+            return backtests[args.command](args, out, err, public_client_factory or create_public_client)
         if args.command == "status":
             return _cmd_status(args, out)
         load_env_file(Path(args.env_file), environ)

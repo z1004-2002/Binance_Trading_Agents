@@ -40,9 +40,10 @@ class Store:
             c.execute("delete from tracked_orders")
             for row in tracked_orders:
                 c.execute(
-                    "insert into tracked_orders (symbol, client_order_id, agent_id, side, committed) "
-                    "values (?, ?, ?, ?, ?)",
-                    (row["symbol"], row["client_order_id"], row["agent_id"], row["side"], row["committed"]),
+                    "insert into tracked_orders (symbol, client_order_id, agent_id, side, committed, protective) "
+                    "values (?, ?, ?, ?, ?, ?)",
+                    (row["symbol"], row["client_order_id"], row["agent_id"], row["side"], row["committed"],
+                     int(row.get("protective", False))),
                 )
             for aid, payload in payloads.items():
                 c.execute(
@@ -64,9 +65,9 @@ class Store:
 
     def load_tracked(self) -> list[dict]:
         rows = self.db.conn.execute(
-            "select symbol, client_order_id, agent_id, side, committed from tracked_orders"
+            "select symbol, client_order_id, agent_id, side, committed, protective from tracked_orders"
         )
-        return [dict(r) for r in rows]
+        return [{**dict(r), "protective": bool(r["protective"])} for r in rows]
 
     def load_state(self, agent_id: str) -> dict | None:
         row = self.db.conn.execute(

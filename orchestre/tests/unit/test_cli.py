@@ -305,3 +305,62 @@ def test_run_without_analysis_flag_skips_market_analysis(tmp_path):
     from orchestre.persistence.db import Database as D_
     from orchestre.persistence.store import Store as S_
     assert code == 0 and S_(D_(tmp_path / "v" / "o.db")).count("sentiment") == 0
+
+
+# --- run --paper ---
+
+def paper_args(tmp_path, cfg, *extra):
+    return ["run", "--paper", "--config", cfg, "--db", str(tmp_path / "v" / "paper.db"),
+            "--stop-file", str(tmp_path / "v" / "STOP"), "--ticks", "1", "--interval", "0", *extra]
+
+
+def run_paper(argv, factory=None):
+    out, err = io.StringIO(), io.StringIO()
+    code = main(argv, environ={}, out=out, err=err, public_client_factory=factory or (lambda: RunStub()),
+                client_factory=lambda *a, **k: (_ for _ in ()).throw(AssertionError("paper : aucune clé ni client privé")),
+                fetch_fng=lambda: FNG)
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_paper_run_needs_no_credentials_and_simulates_the_orders(tmp_path):
+    code, out, err = run_paper(paper_args(tmp_path, team_cfg(tmp_path)))
+    assert code == 0, err
+    assert "MODE PAPER" in out and "Équipe : dca" in out
+    from orchestre.persistence.db import Database as D_
+    from orchestre.persistence.store import Store as S_
+    store = S_(D_(tmp_path / "v" / "paper.db"))
+    paper = store.load_state("paper_exchange")
+    assert D(paper["balances"]["BTC"]) > 0                 # le DCA a « acheté » dans la simulation
+    assert store.load_state("run_mode") == {"mode": "paper"}
+
+
+def test_paper_run_resumes_without_buying_the_same_slot_twice(tmp_path):
+    cfg = team_cfg(tmp_path)
+    run_paper(paper_args(tmp_path, cfg))
+    from orchestre.persistence.db import Database as D_
+    from orchestre.persistence.store import Store as S_
+    first = S_(D_(tmp_path / "v" / "paper.db")).load_state("paper_exchange")["balances"]["BTC"]
+    code, _, err = run_paper(paper_args(tmp_path, cfg))
+    assert code == 0, err
+    assert S_(D_(tmp_path / "v" / "paper.db")).load_state("paper_exchange")["balances"]["BTC"] == first
+
+
+def test_paper_and_live_flags_are_incompatible(tmp_path):
+    cfg = team_cfg(tmp_path, env="live")
+    code, _, err = run_paper(paper_args(tmp_path, cfg, "--live"))
+    assert code == 2 and "incompatibles" in err
+
+
+def test_a_database_is_never_shared_between_paper_and_exchange_modes(tmp_path):
+    cfg = team_cfg(tmp_path)
+    run_paper(paper_args(tmp_path, cfg))
+    args = ["run", "--config", cfg, "--db", str(tmp_path / "v" / "paper.db"), "--stop-file", str(tmp_path / "v" / "STOP"),
+            "--ticks", "1", "--interval", "0"]
+    code, _, err = run(args, KEYS, lambda *a, **k: RunStub())
+    assert code == 2 and "mode 'paper'" in err
+
+
+def test_paper_run_without_any_strategy_is_refused(tmp_path):
+    cfg = write_cfg(tmp_path, 'max_total_capital_quote = "500"\n')
+    code, _, err = run_paper(paper_args(tmp_path, cfg))
+    assert code == 2 and "aucune stratégie" in err

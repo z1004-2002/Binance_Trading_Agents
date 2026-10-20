@@ -20,7 +20,7 @@ cd ~/Desktop/Binance/orchestre
 ../bin-env/bin/python -m pytest -q
 ```
 
-Résultat attendu : `318 passed, 5 skipped` (les 5 tests ignorés sont ceux du testnet, en opt-in).
+Résultat attendu : tous les tests passent ; ceux du testnet (opt-in) sont ignorés tant que `ORCHESTRE_TESTNET=1` n'est pas posé.
 
 ## 1. Vérifications (aucun ordre n'est envoyé)
 
@@ -115,3 +115,60 @@ Le programme refuse de lancer l'argent réel tant que **toutes** ces conditions 
 4. Les clés live dans `.env` (`BINANCE_LIVE_API_KEY`, `BINANCE_LIVE_API_SECRET`), distinctes des clés testnet.
 
 Avant cela, la spec demande au minimum : simulation d'au moins 30 jours sans incident critique, kill switch testé, alertes hors machine opérationnelles, capital réel plafonné à un montant que tu acceptes de perdre entièrement.
+
+## 8. Backtests (données publiques réelles, aucune clé, aucun ordre)
+
+Toutes ces commandes lisent l'historique public de Binance (marché réel) et le mettent en cache dans `data/`.
+
+```bash
+# Une paire, journalier : détention, DCA, 50/50, cash, S-3 tendance, S-4 cassure
+./orchestre.sh backtest --days 1000
+# Une paire, bougies de 4 h : références + S-5 retour à la moyenne
+./orchestre.sh backtest --interval 4h --days 700
+
+# Validation glissante (paramètres choisis sur l'entraînement, jugés hors échantillon)
+./orchestre.sh walkforward --strategy trend      --days 1000
+./orchestre.sh walkforward --strategy breakout   --days 1000
+./orchestre.sh walkforward --strategy meanreversion --interval 4h --days 900
+
+# Portefeuille : S-6 rotation et S-7 rééquilibrage ; --null-runs compare S-6 à des rotations au hasard
+./orchestre.sh portfolio-backtest --days 1000 --null-runs 200
+
+# Équipe entière : allocateur v1 / v2 + gouvernance par régime, comparée aux références
+./orchestre.sh team-backtest --days 1000
+```
+
+**Lecture des résultats.** Ces chiffres sont indicatifs : période courte, univers de cryptos existant aujourd'hui (biais du
+survivant), et un même historique réutilisé pour plusieurs évaluations (chaque essai augmente le risque de sur-ajustement :
+voir la colonne « Essais »). Un backtest n'est pas une promesse de gain ; la vraie validation est la simulation en direct
+(spec, phase 9).
+
+
+## 9. Stratèges à exposition cible (S-3 à S-7) et mode paper
+
+Ces stratèges sont **désactivés par défaut** (`config/strategies.example.toml`) : aucun n'est validé (voir les backtests).
+Chaque position qu'ils ouvrent est protégée par un **stop posé chez Binance** (EX-SEC-14) ; l'arrêt d'urgence (`kill`,
+palier de drawdown 15 %) **laisse ces stops en place** pour que les positions restent protégées.
+
+**Paper = marché réel en lecture, ordres et soldes simulés** (aucune clé, aucun ordre n'atteint Binance). C'est la façon
+sûre de les observer en direct :
+
+```bash
+# 1. activer les stratégies voulues dans un fichier de configuration (enabled = true), par ex. config/paper.toml
+# 2. lancer la simulation (base séparée : une base n'est jamais partagée entre paper et vraie plateforme)
+./orchestre.sh run --paper --config config/paper.toml --db var/paper.db --stop-file var/STOP --interval 60
+./orchestre.sh status --db var/paper.db
+```
+
+Le capital simulé par défaut est le plafond (`max_total_capital_quote`) ; `--paper-cash 500` pour un autre montant.
+Les ordres en attente et les stops simulés sont évalués aux prix relevés à chaque tick (pas intra-bougie).
+
+**À vérifier une fois sur le testnet (test opt-in)** : la pose réelle d'un ordre stop par `ccxt`.
+
+```bash
+ORCHESTRE_TESTNET=1 ../bin-env/bin/python -m pytest tests/integration_testnet -v
+```
+
+En mode réel, une stratégie à exposition cible est refusée sans `promoted = true` dans sa section (décision humaine, §14).
+Limites connues : le stop de protection par défaut de S-6/S-7 (25 %) n'est pas couvert par les backtests ; les stratégies
+à état (S-3, S-4, S-5) sauvegardent leur état pour reprendre après un redémarrage sans vendre par erreur.

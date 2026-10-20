@@ -106,3 +106,29 @@ def percentile(values: Sequence[float], q: float) -> float:
     lo = int(pos)
     hi = min(lo + 1, len(ordered) - 1)
     return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
+
+
+def rsi(closes: Sequence[float], n: int = 14) -> float:
+    """Indice de force relative de Wilder [35]. 100 si aucune baisse, 0 si aucune hausse, 50 si plat."""
+    if len(closes) < n + 1:
+        raise ValueError(f"au moins {n + 1} clôtures requises")
+    changes = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains, losses = [max(c, 0.0) for c in changes], [max(-c, 0.0) for c in changes]
+    avg_gain, avg_loss = sum(gains[:n]) / n, sum(losses[:n]) / n
+    for g, l in zip(gains[n:], losses[n:]):
+        avg_gain, avg_loss = (avg_gain * (n - 1) + g) / n, (avg_loss * (n - 1) + l) / n
+    if avg_gain == 0 and avg_loss == 0:
+        return 50.0
+    if avg_loss == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_gain / avg_loss)
+
+
+def bollinger(closes: Sequence[float], n: int = 20, k: float = 2.0) -> tuple[float, float, float]:
+    """(bande basse, moyenne, bande haute) : moyenne mobile ± k écarts-types de population [36]."""
+    if len(closes) < n:
+        raise ValueError(f"au moins {n} clôtures requises")
+    window = closes[-n:]
+    mid = sum(window) / n
+    std = sqrt(sum((x - mid) ** 2 for x in window) / n)
+    return mid - k * std, mid, mid + k * std

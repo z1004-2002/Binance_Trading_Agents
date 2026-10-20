@@ -19,6 +19,7 @@ from orchestre.config import Settings
 from orchestre.core.agent import Agent, AgentState
 from orchestre.core.clock import Clock
 from orchestre.exchange.base import Exchange, IpBannedError
+from orchestre.exchange.paper import PaperExchange
 from orchestre.execution.service import ExecutionService
 from orchestre.persistence.store import Store
 from orchestre.portfolio.allocator import StrategyBudget, apply_allocations, compute_allocations, min_viable_budget
@@ -27,6 +28,7 @@ from orchestre.risk.models import OrderProposal, RiskContext
 from orchestre.runtime.alerts import Alerts
 from orchestre.strategies.dca import DcaConfig
 from orchestre.strategies.dca_runner import DcaRunner
+from orchestre.strategies.exposure_runner import ExposureRunner, PortfolioRunner
 from orchestre.strategies.grid import GridConfig, range_status
 from orchestre.strategies.grid_runner import GridRunner
 from orchestre.supervisor.service import Supervisor
@@ -86,9 +88,15 @@ class _SimpleAgent(Agent):
 
 
 class _Unit:
-    def __init__(self, agent_id: str, symbol: str, kind: str, runner, grid_cfg: GridConfig | None, budget: Decimal):
+    def __init__(
+        self, agent_id: str, symbol: str, kind: str, runner, grid_cfg: GridConfig | None, budget: Decimal,
+        code: str = "", symbols: list[str] | None = None, min_viable: Decimal | None = None, prices_fn=None,
+    ):
         self.agent_id, self.symbol, self.kind = agent_id, symbol, kind
         self.runner, self._grid_cfg, self.budget = runner, grid_cfg, budget
+        self.code = code or {"grid": "S-2", "dca": "S-1"}.get(kind, "")
+        self.symbols = symbols or [symbol]
+        self.min_viable, self._prices_fn = min_viable, prices_fn
         self.started = False
         self.errors = 0
         self.fear_greed: int | None = None
@@ -103,8 +111,21 @@ class _Unit:
                 self.runner.start(price)
                 self.started = True
             self.runner.step(price)
+        elif self.kind == "exposure":
+            self.runner.step(now, price)
+        elif self.kind == "portfolio":
+            self.runner.step(now, {sym: self._prices_fn()[sym] for sym in self.symbols})
         else:
             self.runner.step(now, price, self.fear_greed)
+
+    @property
+    def positioned(self) -> bool:
+        """Vrai tant que l'agent détient une position (exposition cible)."""
+        if self.kind == "exposure":
+            return self.runner.leg.qty > 0
+        if self.kind == "portfolio":
+            return any(leg.qty > 0 for leg in self.runner.legs.values())
+        return False
 
     def export_state(self) -> dict:
         state = self.runner.export_state()
@@ -159,6 +180,7 @@ class Orchestrator:
         self._last_reconcile: datetime | None = None
         self._startup_done = False
         self._kill_handled = False
+        self.run_mode = "exchange"
 
     # --- composition de l'équipe ---
     def _reserve_budget(self, agent_id: str, budget: Decimal) -> None:
@@ -195,12 +217,44 @@ class Orchestrator:
         )
         self._register(_Unit(cfg.agent_id, cfg.symbol, "dca", runner, None, cfg.cumulative_cap))
 
+    def add_exposure(
+        self, agent_id: str, code: str, strategy, symbol: str, budget: Decimal, interval: str = "1d",
+    ) -> None:
+        """Stratège à exposition cible sur une paire (S-3, S-4, S-5) : exposition -> ordres + stop chez Binance."""
+        self._reserve_budget(agent_id, budget)
+        runner = ExposureRunner(
+            strategy, symbol, interval, self.svc, self._context_factory(agent_id), self.exchange, agent_id,
+            symbol.removesuffix(self.settings.quote_currency), lambda: self.ledger.account(agent_id).allocated,
+            env=self.settings.env,
+        )
+        minimum = self._symbol_filters(symbol).min_notional * Decimal("1.2")
+        self._register(_Unit(agent_id, symbol, "exposure", runner, None, budget, code=code, min_viable=minimum))
+
+    def add_portfolio(
+        self, agent_id: str, code: str, strategy, symbols: list[str], budget: Decimal, interval: str = "1d",
+        default_stop_pct: Decimal = Decimal("0.25"), positions: int = 1,
+    ) -> None:
+        """Stratège de portefeuille (S-6 rotation, S-7 rééquilibrage) : poids par actif -> ordres + stops."""
+        self._reserve_budget(agent_id, budget)
+        quote = self.settings.quote_currency
+        runner = PortfolioRunner(
+            strategy, symbols, interval, self.svc, self._context_factory(agent_id), self.exchange, agent_id,
+            {s: s.removesuffix(quote) for s in symbols}, lambda: self.ledger.account(agent_id).allocated,
+            env=self.settings.env, default_stop_pct=default_stop_pct,
+        )
+        minimum = max(self._symbol_filters(s).min_notional for s in symbols) * Decimal("1.2") * positions
+        self._register(_Unit(agent_id, symbols[0], "portfolio", runner, None, budget, code=code, symbols=list(symbols),
+                             min_viable=minimum, prices_fn=lambda: self._prices))
+
     # --- contexte de risque (instantané du tick) ---
-    def _context_factory(self, agent_id: str, symbol: str, max_deviation: Decimal) -> Callable[[OrderProposal], RiskContext]:
-        def build(_proposal: OrderProposal) -> RiskContext:
+    def _context_factory(
+        self, agent_id: str, symbol: str | None = None, max_deviation: Decimal = Decimal("0.02")
+    ) -> Callable[[OrderProposal], RiskContext]:
+        def build(proposal: OrderProposal) -> RiskContext:
+            symbol = proposal.symbol
             committed = sum((a.committed for a in self.ledger.accounts()), Decimal("0"))
             symbol_committed = sum(
-                (self.ledger.account(u.agent_id).committed for u in self.units.values() if u.symbol == symbol),
+                (self.ledger.account(u.agent_id).committed for u in self.units.values() if symbol in u.symbols),
                 Decimal("0"),
             )
             return RiskContext(
@@ -212,7 +266,7 @@ class Orchestrator:
                 capital_quote=self.settings.max_total_capital_quote,
                 last_price=self._prices[symbol], min_notional=self._symbol_filters(symbol).min_notional,
                 max_order_notional=self.limits.max_order_notional, max_price_deviation_pct=max_deviation,
-                pair_liquid=self._liquid.get(symbol, True), pair_allowed=symbol in {u.symbol for u in self.units.values()},
+                pair_liquid=self._liquid.get(symbol, True), pair_allowed=symbol in {s for u in self.units.values() for s in u.symbols},
                 asset_exposure_quote=symbol_committed, total_crypto_exposure_quote=committed,
                 open_orders_agent=self.svc.open_order_count(agent_id),
                 max_open_orders_agent=self.limits.max_open_orders_agent,
@@ -242,6 +296,9 @@ class Orchestrator:
         saved = self.store.load_state("orchestrator")
         if saved is not None:
             self.state = RuntimeState.from_dict(saved)
+        paper = self.store.load_state("paper_exchange")
+        if paper is not None and isinstance(self.exchange, PaperExchange):
+            self.exchange.import_state(paper)
 
     # --- un tick ---
     def run_once(self) -> str:
@@ -249,7 +306,7 @@ class Orchestrator:
         if self.supervisor.kill_switch_active():
             return self._handle_kill("kill switch actif")
 
-        symbols = sorted({u.symbol for u in self.units.values()})
+        symbols = sorted({sym for u in self.units.values() for sym in u.symbols})
         try:
             self._prices = {s: self.exchange.get_price(s) for s in symbols}
             balances = self.exchange.get_balances()
@@ -334,14 +391,18 @@ class Orchestrator:
         configs = []
         for unit in self.units.values():
             if unit.kind == "grid":
-                strategy = "S-2"
                 minimum = min_viable_budget(unit.grid_cfg.intervals, unit.grid_cfg.min_notional)
+            elif unit.min_viable is not None:
+                minimum = unit.min_viable
             else:
-                strategy, minimum = "S-1", self._symbol_filters(unit.symbol).min_notional
+                minimum = self._symbol_filters(unit.symbol).min_notional
             base = unit.budget / 2 if self.state.tier1_applied else unit.budget
-            configs.append(StrategyBudget(unit.agent_id, strategy, base, minimum))
+            configs.append(StrategyBudget(unit.agent_id, unit.code, base, minimum))
         allocations = compute_allocations(configs, regime, self.ledger.total, self.settings.treasury_reserve_pct)
         apply_allocations(self.ledger, allocations)
+        for unit in self.units.values():       # budget nul : un agent à exposition cible sort de ses positions
+            if unit.kind in ("exposure", "portfolio"):
+                unit.runner.suspended = allocations[unit.agent_id].budget == 0
         detail = ", ".join(f"{aid}={a.budget} ({a.status})" for aid, a in allocations.items())
         self.alerts.send("INFO", f"régime {regime.value} : budgets {detail}")
 
@@ -359,6 +420,17 @@ class Orchestrator:
         else:
             unit.errors = 0
             self.supervisor.heartbeat(agent_id)
+        self._forward_runner_alerts(agent_id, unit)
+
+    def _forward_runner_alerts(self, agent_id: str, unit: _Unit) -> None:
+        drain = getattr(unit.runner, "drain_alerts", None)
+        for text in drain() if drain else []:
+            critical = "urgence" in text or "non protégée" in text
+            self.alerts.send("CRITICAL" if critical else "WARNING", f"{agent_id} : {text}")
+        if unit.kind in ("exposure", "portfolio") and unit.runner.suspended and not unit.positioned:
+            free = self.ledger.account(agent_id).available
+            if free > 0:
+                self.ledger.deallocate(agent_id, free)      # budget libéré tant que le régime est défavorable
 
     def _finish(self, status: str, now: datetime) -> str:
         self._health()
@@ -424,7 +496,7 @@ class Orchestrator:
         if not self._kill_handled:
             self._kill_handled = True
             self.supervisor.apply_command("kill")
-            for symbol in sorted({u.symbol for u in self.units.values()}):
+            for symbol in sorted({sym for u in self.units.values() for sym in u.symbols}):
                 self.svc.cancel_all_open(symbol)
             self.alerts.send("CRITICAL", f"kill switch : {reason}; ordres ouverts annulés, agents arrêtés")
             self._persist(self.clock.now())
@@ -433,6 +505,9 @@ class Orchestrator:
     def _persist(self, now: datetime) -> None:
         states = {aid: u.export_state() for aid, u in self.units.items()}
         states["orchestrator"] = self.state.to_dict()
+        states["run_mode"] = {"mode": self.run_mode}
+        if isinstance(self.exchange, PaperExchange):
+            states["paper_exchange"] = self.exchange.export_state()
         self.store.save_all(self.ledger, self.svc.export_tracked(), states, now)
 
     # --- boucle ---

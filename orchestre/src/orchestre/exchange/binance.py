@@ -50,6 +50,11 @@ def create_client(env: Env, api_key: str, api_secret: str, live_confirmed: bool 
     return client
 
 
+def create_public_client() -> ccxt.binance:
+    """Client sans clé pour les données de marché publiques du marché réel (backtests) : aucun ordre possible."""
+    return ccxt.binance({"enableRateLimit": True, "options": {"defaultType": "spot"}})
+
+
 class BinanceExchange(Exchange):
     def __init__(
         self,
@@ -100,8 +105,11 @@ class BinanceExchange(Exchange):
         """Permissions de la clé (`/sapi`, réel uniquement : absent du testnet, EX-SEC-05)."""
         return dict(self._call(self._client.sapiGetAccountApiRestrictions))
 
-    def get_candles(self, symbol: str, interval: str, limit: int) -> list[Candle]:
-        rows = self._call(self._client.publicGetKlines, {"symbol": symbol, "interval": interval, "limit": limit})
+    def get_candles(self, symbol: str, interval: str, limit: int, end_time: datetime | None = None) -> list[Candle]:
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        if end_time is not None:
+            params["endTime"] = int(end_time.timestamp() * 1000) - 1  # fin exclue
+        rows = self._call(self._client.publicGetKlines, params)
         now = self._now_ms()
         to_dt = lambda ms: datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)  # noqa: E731
         return [
@@ -131,7 +139,11 @@ class BinanceExchange(Exchange):
     # --- écriture (ExecutionAgent uniquement) ---
     def place_order(self, request: OrderRequest) -> OrderResult:
         params = {"newClientOrderId": request.client_order_id, "selfTradePreventionMode": STP_MODE}
-        if request.price is None:
+        if request.stop_price is not None:   # STOP_LOSS_LIMIT : protection posée chez Binance (EX-SEC-14)
+            type_, price = "limit", float(request.price)
+            params["stopLossPrice"] = float(request.stop_price)
+            params["timeInForce"] = "GTC"
+        elif request.price is None:
             type_, price = "market", None
         else:
             type_, price = "limit", float(request.price)

@@ -59,3 +59,56 @@ def test_invalid_strategy_values_are_reported_as_config_errors(tmp_path):
                                    "intervals": 400, "budget_quote": "200"}}}
     with pytest.raises(ConfigError, match="grid"):
         build_team(raw, o, ex, T0)
+
+
+# --- stratèges à exposition cible ---
+
+def extended(tmp_path, env="testnet"):
+    ex = FakeExchange(
+        {"BTCUSDT": F, "ETHUSDT": SymbolFilters("ETHUSDT", D("0.01"), D("0.0001"), D("0.0001"), D("1000"), D("5"))},
+        {"BTCUSDT": D("60000"), "ETHUSDT": D("3000")}, {"USDT": D("1000")},
+    )
+    settings = parse_settings({"env": env, "max_total_capital_quote": "500"}, live_flag=env == "live")
+    return Orchestrator(settings, ex, Ledger(D("500")), Store(Database(":memory:")), SimulatedClock(T0), tmp_path / "STOP"), ex
+
+
+def test_exposure_sections_build_the_matching_agents(tmp_path):
+    o, ex = extended(tmp_path)
+    raw = {"strategies": {
+        "trend": {"enabled": True, "symbol": "BTCUSDT", "budget_quote": "50", "atr_mult": 2.5},
+        "breakout": {"enabled": True, "symbol": "BTCUSDT", "budget_quote": "50", "entry_len": 40, "exit_len": 20},
+        "meanreversion": {"enabled": True, "symbol": "BTCUSDT", "budget_quote": "50"},
+        "rotation": {"enabled": True, "symbols": ["BTCUSDT", "ETHUSDT"], "budget_quote": "80", "top_k": 2},
+        "rebalance": {"enabled": True, "budget_quote": "50", "weights": {"BTCUSDT": "0.5"}},
+    }}
+    added = build_team(raw, o, ex, T0)
+    assert added == ["trend", "breakout", "meanreversion", "rotation", "rebalance"]
+    assert {u.code for u in o.units.values()} == {"S-3", "S-4", "S-5", "S-6", "S-7"}
+    assert o.units["meanreversion"].runner.interval == "4h" and o.units["trend"].runner.interval == "1d"
+    assert o.units["rotation"].symbols == ["BTCUSDT", "ETHUSDT"]
+    assert o.units["trend"].runner.strategy._atr_mult == 2.5
+
+
+def test_live_refuses_exposure_strategies_that_were_not_explicitly_promoted(tmp_path):
+    o, ex = extended(tmp_path, env="live")
+    raw = {"strategies": {"trend": {"enabled": True, "symbol": "BTCUSDT", "budget_quote": "50"}}}
+    with pytest.raises(ConfigError, match="promoted"):
+        build_team(raw, o, ex, T0)
+    raw["strategies"]["trend"]["promoted"] = True
+    assert build_team(raw, o, ex, T0) == ["trend"]
+
+
+def test_invalid_exposure_parameters_are_config_errors(tmp_path):
+    o, ex = extended(tmp_path)
+    with pytest.raises(ConfigError, match="breakout"):
+        build_team({"strategies": {"breakout": {"enabled": True, "symbol": "BTCUSDT", "budget_quote": "50",
+                                               "entry_len": 5, "exit_len": 20}}}, o, ex, T0)
+    with pytest.raises(ConfigError, match="budget_quote"):
+        build_team({"strategies": {"trend": {"enabled": True, "symbol": "BTCUSDT"}}}, o, ex, T0)
+
+
+def test_example_config_keeps_exposure_strategies_disabled(tmp_path):
+    import tomllib
+    o, ex = extended(tmp_path)
+    ids = build_team(tomllib.loads(EXAMPLE.read_text()), o, ex, T0)
+    assert ids == ["dca", "grid"]

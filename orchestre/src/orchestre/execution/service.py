@@ -27,6 +27,7 @@ class _Tracked:
     agent_id: str
     side: Side
     committed: Decimal
+    protective: bool = False
 
 
 class ExecutionService:
@@ -50,7 +51,10 @@ class ExecutionService:
 
         filters = self._exchange.get_filters(p.symbol)
         qty = round_qty(p.quantity, filters)
-        price = round_price(p.limit_price or p.price, p.side, filters)
+        # un stop de vente : limite arrondie vers le bas (plus facile à exécuter), déclenchement au tick inférieur
+        side_for_price = Side.BUY if p.stop_price is not None else p.side
+        price = round_price(p.limit_price or p.price, side_for_price, filters)
+        stop_price = round_price(p.stop_price, Side.BUY, filters) if p.stop_price is not None else None
         try:
             validate_order(qty, price, filters)
         except FilterError as exc:
@@ -65,6 +69,7 @@ class ExecutionService:
             quantity=qty,
             price=price if p.limit_price is not None else None,
             client_order_id=client_order_id,
+            stop_price=stop_price,
         )
         self.orders_sent += 1
         try:
@@ -79,12 +84,15 @@ class ExecutionService:
             return self._settle(approved, known, f"statut récupéré après {exc!r}")
         return self._settle(approved, result, "ordre envoyé")
 
+    def filters(self, symbol: str):
+        return self._exchange.get_filters(symbol)
+
     # --- persistance (A-7) ---
     def export_tracked(self) -> list[dict]:
         return [
             {
                 "symbol": s, "client_order_id": cid, "agent_id": t.agent_id,
-                "side": t.side.value, "committed": str(t.committed),
+                "side": t.side.value, "committed": str(t.committed), "protective": t.protective,
             }
             for (s, cid), t in sorted(self._tracked.items())
         ]
@@ -92,7 +100,7 @@ class ExecutionService:
     def import_tracked(self, rows: list[dict]) -> None:
         self._tracked = {
             (r["symbol"], r["client_order_id"]): _Tracked(
-                r["agent_id"], Side(r["side"]), Decimal(r["committed"])
+                r["agent_id"], Side(r["side"]), Decimal(r["committed"]), bool(r.get("protective", False))
             )
             for r in rows
         }
@@ -107,10 +115,12 @@ class ExecutionService:
     def open_order_ids(self, symbol: str) -> list[str]:
         return sorted(cid for (s, cid) in self._tracked if s == symbol)
 
-    def sync(self, symbol: str) -> list[ExecutionReport]:
-        """Règle les ordres suivis exécutés ou annulés depuis le dernier appel."""
+    def sync(self, symbol: str, agent_id: str | None = None) -> list[ExecutionReport]:
+        """Règle les ordres suivis exécutés ou annulés depuis le dernier appel (d'un agent, ou de tous)."""
         reports = []
         for cid in self.open_order_ids(symbol):
+            if agent_id is not None and self._tracked[(symbol, cid)].agent_id != agent_id:
+                continue
             result = self._exchange.get_order(symbol, cid)
             if result is None or result.status == "NEW":
                 continue
@@ -123,10 +133,19 @@ class ExecutionService:
             return self._close_tracked(symbol, client_order_id, result)
         return ExecutionReport(result.status, "annulation d'un ordre non suivi", result)
 
-    def cancel_all_open(self, symbol: str) -> list[ExecutionReport]:
-        """Zéro ordre orphelin à l'arrêt (EX-ST-06) : suivis et inconnus confondus."""
+    def cancel_all_open(
+        self, symbol: str, agent_id: str | None = None, keep_protective: bool = True
+    ) -> list[ExecutionReport]:
+        """Zéro ordre orphelin à l'arrêt (EX-ST-06). Les stops de protection restent en place par défaut :
+        ils doivent protéger les positions même si le programme s'arrête (EX-SEC-14). Avec `agent_id`, seuls les
+        ordres suivis de cet agent sont annulés."""
         ids = set(self.open_order_ids(symbol))
-        ids |= {o.client_order_id for o in self._exchange.get_open_orders(symbol)}
+        if agent_id is not None:
+            ids = {c for c in ids if self._tracked[(symbol, c)].agent_id == agent_id}
+        else:
+            ids |= {o.client_order_id for o in self._exchange.get_open_orders(symbol)}
+        if keep_protective:
+            ids = {c for c in ids if not self._tracked.get((symbol, c), _Tracked("", Side.SELL, Decimal(0))).protective}
         return [self.cancel(symbol, cid) for cid in sorted(ids)]
 
     def reconcile(self, symbol: str) -> list[str]:
@@ -150,7 +169,7 @@ class ExecutionService:
                 if result.side is Side.BUY:
                     committed = result.orig_qty * result.avg_price + p.est_fee
                     self._ledger.commit(p.agent_id, committed)
-                self._tracked[key] = _Tracked(p.agent_id, result.side, committed)
+                self._tracked[key] = _Tracked(p.agent_id, result.side, committed, p.stop_price is not None)
             return ExecutionReport("OPEN", f"{note}: ordre en attente", result)
         if result.status != "FILLED":
             self.consecutive_errors += 1

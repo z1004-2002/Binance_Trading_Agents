@@ -82,7 +82,7 @@ def _r06(p: OrderProposal, c: RiskContext) -> str | None:
 
 
 def _r07(p: OrderProposal, c: RiskContext) -> str | None:
-    if p.limit_price is None:
+    if p.limit_price is None or p.kind == "stop":
         return None
     deviation = abs(p.limit_price - c.last_price) / c.last_price
     if deviation > c.max_price_deviation_pct:

@@ -49,3 +49,14 @@ def test_binance_klines_are_exact_decimals_with_closed_flag():
 def test_binance_depth_parsed_as_decimals():
     book = BinanceExchange(StubClient()).get_order_book("BTCUSDT", 5)
     assert book.bids[0] == (D("59990.00"), D("1.5")) and book.asks[1] == (D("60020.00"), D("3"))
+
+
+def test_end_time_pages_backwards_in_fake_and_binance():
+    ex = FakeExchange({"BTCUSDT": F}, {"BTCUSDT": D("100")}, {})
+    candles = [Candle(T0.replace(day=1 + i), T0, D("1"), D("1"), D("1"), D("1"), D("1"), True) for i in range(10)]
+    ex.set_candles("BTCUSDT", "1d", candles)
+    got = ex.get_candles("BTCUSDT", "1d", 3, end_time=candles[5].open_time)
+    assert [c.open_time for c in got] == [c.open_time for c in candles[2:5]]  # fin exclue
+    stub = StubClient()
+    BinanceExchange(stub).get_candles("BTCUSDT", "1d", 2, end_time=T0)
+    assert stub.calls[-1][1]["endTime"] == int(T0.timestamp() * 1000) - 1
